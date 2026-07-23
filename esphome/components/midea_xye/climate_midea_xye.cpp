@@ -13,6 +13,28 @@ const char *const Constants::FREEZE_PROTECTION = "Freeze Protection";
 const char *const Constants::SILENT = "Silent";
 const char *const Constants::TURBO = "Turbo";
 
+std::vector<std::pair<uart::UARTComponent *, ClimateMideaXYE *>> ClimateMideaXYE::bus_claims_{};
+
+bool ClimateMideaXYE::try_claim_bus_() {
+  for (auto &claim : bus_claims_) {
+    if (claim.first == this->uart_) {
+      if (claim.second != nullptr && claim.second != this)
+        return false;  // another instance is mid-transaction on this bus
+      claim.second = this;
+      return true;
+    }
+  }
+  bus_claims_.emplace_back(this->uart_, this);
+  return true;
+}
+
+void ClimateMideaXYE::release_bus_() {
+  for (auto &claim : bus_claims_) {
+    if (claim.first == this->uart_ && claim.second == this)
+      claim.second = nullptr;
+  }
+}
+
 static void set_sensor(Sensor *sensor, float value) {
   if (sensor != nullptr && (!sensor->has_state() || sensor->get_raw_state() != value))
     sensor->publish_state(value);
@@ -125,6 +147,11 @@ void ClimateMideaXYE::setTransmitParams() {
 void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
   // TODO: Reimplement flow control for manual RS485 flow control chips
   // digitalWrite(ComControlPin, RS485_TX_PIN_VALUE);
+  // Drop any stale bytes (a late reply to a previous poll, or another unit's
+  // traffic) so the read window below only ever sees this frame's response.
+  uint8_t stale;
+  while (this->uart_->available())
+    this->uart_->read_byte(&stale);
   // Log outgoing message at debug level
   tx_data.print_debug(Constants::TAG, TX_MESSAGE_LENGTH, ESPHOME_LOG_LEVEL_DEBUG);
   this->uart_->write_array(tx_data.raw, TX_MESSAGE_LENGTH);
@@ -140,7 +167,12 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
         this->uart_->read_byte(&rx_data.raw[i]);
       i++;
     }
-    if (i == RX_MESSAGE_LENGTH) {
+    // Transaction over either way: free the bus for any other instance.
+    this->release_bus_();
+    // A complete frame must also come from the unit this instance polls
+    // (response byte 4, Source ID); on a shared bus this rejects a frame from
+    // any other unit (e.g. two units accidentally set to the same dial).
+    if (i == RX_MESSAGE_LENGTH && rx_data.message.frame.header.source == this->address_) {
       // The configured address answered: the bus is responsive, clear the miss
       // counter so a transient gap never accumulates toward a needless sweep.
       this->miss_count_ = 0;
@@ -184,6 +216,9 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       // suspicious and worth surfacing.
       if (i == 0) {
         ESP_LOGD(Constants::TAG, "No response for command %02X", cmdSent);
+      } else if (i == RX_MESSAGE_LENGTH) {
+        ESP_LOGW(Constants::TAG, "Response from unit 0x%02X while polling 0x%02X for Command %02X; ignoring",
+                 rx_data.message.frame.header.source, this->address_, cmdSent);
       } else {
         ESP_LOGW(Constants::TAG, "Bad response length (%u bytes, expected %u) for Command %02X; resyncing",
                  i, RX_MESSAGE_LENGTH, cmdSent);
@@ -227,6 +262,12 @@ void ClimateMideaXYE::send_probe_() {
   // per address independent of the (slower) poll period; normal polling stays
   // suspended (see update()) so only one frame is ever in flight.
   //
+  // Probes respect shared-bus arbitration too: on a bus with several instances,
+  // never transmit a probe over another instance's pending reply.
+  if (!this->try_claim_bus_()) {
+    this->set_timeout("discover-gap", BUS_BUSY_RETRY_DELAY_MS, [this]() { this->send_probe_(); });
+    return;
+  }
   // Drop any stale bytes first (e.g. a late reply to the previous probe) so this
   // probe's read window only sees a response to this address.
   uint8_t stale;
@@ -244,6 +285,9 @@ void ClimateMideaXYE::send_probe_() {
         this->uart_->read_byte(&this->rx_data.raw[i]);
       i++;
     }
+    // Probe transaction over: free the bus between probes so other instances
+    // can interleave their polls with a (possibly long) address sweep.
+    this->release_bus_();
     const bool found = (i == RX_MESSAGE_LENGTH) && this->rx_data.is_valid() &&
                        (this->rx_data.message.frame.header.source == this->scan_addr_);
     if (found) {
@@ -282,6 +326,20 @@ void ClimateMideaXYE::update() {
   // suspend the normal poll cycle so there is never more than one frame in flight.
   if (this->discovering_)
     return;
+  // Shared-bus arbitration: when several instances poll units on one UART, only
+  // one transaction may be in flight — like a real CCM polling one unit at a time.
+  // If another instance holds the bus, retry shortly instead of transmitting over
+  // its pending reply.
+  if (controlState != ControlState::WAIT_DATA && !this->try_claim_bus_()) {
+    if (this->bus_retry_count_ < BUS_BUSY_MAX_RETRIES) {
+      this->bus_retry_count_++;
+      this->set_timeout("bus-retry", BUS_BUSY_RETRY_DELAY_MS, [this]() { this->update(); });
+    } else {
+      this->bus_retry_count_ = 0;  // give up this cycle; the next poll starts over
+    }
+    return;
+  }
+  this->bus_retry_count_ = 0;
   // Possible States:
   // 0: Waiting for Response from Command
   // 1: Sending Set C3 Command

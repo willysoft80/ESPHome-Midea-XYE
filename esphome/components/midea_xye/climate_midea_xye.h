@@ -9,6 +9,9 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
+
+#include <utility>
+#include <vector>
 #ifdef USE_BINARY_SENSOR
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #endif
@@ -90,6 +93,16 @@ constexpr uint8_t CAPABILITIES_SWING = static_cast<uint8_t>(xye::Capabilities::S
 /// Precision step for `current_temperature` reported to Home Assistant (0.01 °C → 2 decimal places).
 /// Applies to both the XYE-bus internal temperature and any external follow_me sensor value.
 constexpr float VISUAL_CURRENT_TEMPERATURE_STEP = 0.01f;
+
+/// Delay before retrying a poll cycle that found the shared RS-485 bus claimed by
+/// another climate instance (multiple indoor units on one UART). Slightly longer
+/// than the default 100 ms response timeout, so the competing transaction has
+/// completed by the time the retry fires.
+constexpr uint32_t BUS_BUSY_RETRY_DELAY_MS = 150;
+/// Maximum consecutive busy-retries within one poll cycle. Past this the cycle is
+/// skipped and the next scheduled update() starts over. Bounds scheduler load when
+/// many instances share one bus.
+constexpr uint8_t BUS_BUSY_MAX_RETRIES = 4;
 
 constexpr uint8_t OP_FLAG_WATER_PUMP = static_cast<uint8_t>(xye::OperationFlags::WATER_PUMP);
 constexpr uint8_t OP_FLAG_WATER_LOCK = static_cast<uint8_t>(xye::OperationFlags::WATER_LOCK);
@@ -237,6 +250,18 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // ignored after we issue a SET. Prevents a transient mode flap
   // (e.g. cool -> off -> cool) while the unit acknowledges the new mode.
   uint8_t post_set_grace_{0};
+  // --- Shared-bus arbitration (multiple climate instances on one UART) ---
+  // The XYE bus is master/slave: a real CCM polls units strictly one at a time.
+  // Multiple instances of this component on one uart each poll on their own
+  // schedule, so without coordination their frames overlap on the wire and their
+  // read windows drain each other's bytes from the shared RX buffer. ESPHome is
+  // single-threaded, so a static claim registry suffices: an instance claims the
+  // bus for its whole send+read transaction and releases it in the read callback;
+  // an instance that finds the bus busy retries shortly instead of transmitting.
+  static std::vector<std::pair<uart::UARTComponent *, ClimateMideaXYE *>> bus_claims_;
+  bool try_claim_bus_();
+  void release_bus_();
+  uint8_t bus_retry_count_{0};
 
  protected:
   uart::UARTComponent *uart_;
