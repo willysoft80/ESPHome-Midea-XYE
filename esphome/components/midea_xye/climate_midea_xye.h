@@ -99,6 +99,16 @@ constexpr float VISUAL_CURRENT_TEMPERATURE_STEP = 0.01f;
 /// than the default 100 ms response timeout, so the competing transaction has
 /// completed by the time the retry fires.
 constexpr uint32_t BUS_BUSY_RETRY_DELAY_MS = 150;
+/// Scratch size for scanning a poll window for a response frame; sized for the
+/// longest observed extended response (~64 bytes) with margin.
+constexpr size_t BUS_RX_SCAN_BUFFER_SIZE = 96;
+/// Receive-frame byte offset of the Source ID (the answering unit's address).
+constexpr size_t RX_OFFSET_SOURCE = 4;
+/// Extended (variable-length) responses share the standard layout only for the
+/// leading bytes (through the 16-bit error flags); fields beyond this offset are
+/// dialect-specific and are zeroed when a standard frame is synthesized from the
+/// head. Observed on Clivet IB3-XY 53M (Midea OEM) cassettes.
+constexpr size_t RX_EXTENDED_TRUSTED_HEAD = 24;
 /// Maximum consecutive busy-retries within one poll cycle. Past this the cycle is
 /// skipped and the next scheduled update() starts over. Bounds scheduler load when
 /// many instances share one bus.
@@ -262,6 +272,11 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   bool try_claim_bus_();
   void release_bus_();
   uint8_t bus_retry_count_{0};
+  // Scan a drained poll window for a response from the polled unit: accepts a
+  // standard 32-byte frame at any offset, or an extended variable-length frame
+  // (same head layout, extra payload, CRC+prologue at the very end) from which a
+  // standard frame is synthesized. Fills rx_data and returns true on success.
+  bool extract_frame_(const uint8_t *buf, size_t n);
 
  protected:
   uart::UARTComponent *uart_;

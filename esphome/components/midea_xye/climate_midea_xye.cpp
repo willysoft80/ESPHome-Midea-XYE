@@ -4,6 +4,8 @@
 
 #include "esphome/core/log.h"
 
+#include <cstring>
+
 namespace esphome {
 namespace midea {
 namespace xye {
@@ -33,6 +35,40 @@ void ClimateMideaXYE::release_bus_() {
     if (claim.first == this->uart_ && claim.second == this)
       claim.second = nullptr;
   }
+}
+
+bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n) {
+  if (n < RX_MESSAGE_LENGTH)
+    return false;
+  for (size_t off = 0; off + RX_MESSAGE_LENGTH <= n; off++) {
+    if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
+      continue;
+    if (buf[off + RX_OFFSET_SOURCE] != this->address_)
+      continue;
+    // Standard fixed-length frame at this offset?
+    memcpy(rx_data.raw, &buf[off], RX_MESSAGE_LENGTH);
+    if (rx_data.is_valid())
+      return true;
+    // Extended variable-length frame: same head layout, dialect-specific extra
+    // payload, CRC and prologue only at the very end (observed ~55-64 bytes on
+    // Clivet IB3-XY 53M cassettes). Accept when the whole span checksums, then
+    // synthesize a standard frame from the trusted head so ParseResponse can
+    // treat it like any other response.
+    for (size_t end = off + RX_MESSAGE_LENGTH + 1; end <= n; end++) {
+      if (buf[end - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
+        continue;
+      const uint8_t span = static_cast<uint8_t>(end - off);
+      if (buf[end - 2] != compute_protocol_crc(&buf[off], span))
+        continue;
+      memcpy(rx_data.raw, &buf[off], RX_EXTENDED_TRUSTED_HEAD);
+      memset(rx_data.raw + RX_EXTENDED_TRUSTED_HEAD, 0, RX_MESSAGE_LENGTH - RX_EXTENDED_TRUSTED_HEAD);
+      rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+      rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+      ESP_LOGD(Constants::TAG, "Accepted extended %u-byte response from unit 0x%02X", span, this->address_);
+      return true;
+    }
+  }
+  return false;
 }
 
 static void set_sensor(Sensor *sensor, float value) {
@@ -161,18 +197,25 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
   this->set_timeout("read-result", this->response_timeout, [this, cmdSent]() {
     // digitalWrite(ComControlPin, RS485_RX_PIN_VALUE);
 
-    uint8_t i = 0;
+    // Read the whole window into a scratch buffer, then SCAN it for a response
+    // frame instead of assuming the buffer holds exactly one fixed-length frame:
+    // some units answer with extra bytes around/after the standard response.
+    uint8_t buf[BUS_RX_SCAN_BUFFER_SIZE];
+    size_t n = 0;
+    uint8_t discard;
     while (this->uart_->available()) {
-      if (i < RX_MESSAGE_LENGTH)
-        this->uart_->read_byte(&rx_data.raw[i]);
-      i++;
+      if (n < sizeof(buf)) {
+        this->uart_->read_byte(&buf[n]);
+        n++;
+      } else {
+        this->uart_->read_byte(&discard);
+      }
     }
     // Transaction over either way: free the bus for any other instance.
     this->release_bus_();
-    // A complete frame must also come from the unit this instance polls
-    // (response byte 4, Source ID); on a shared bus this rejects a frame from
-    // any other unit (e.g. two units accidentally set to the same dial).
-    if (i == RX_MESSAGE_LENGTH && rx_data.message.frame.header.source == this->address_) {
+    // extract_frame_ also enforces the Source ID (response byte 4), so on a
+    // shared bus a frame from any other unit is never accepted.
+    if (this->extract_frame_(buf, n)) {
       // The configured address answered: the bus is responsive, clear the miss
       // counter so a transient gap never accumulates toward a needless sweep.
       this->miss_count_ = 0;
@@ -181,7 +224,7 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       // (i.e. one that never triggered an auto-discovery sweep).
       this->publish_discovered_address_();
       // Log incoming message at debug level
-      rx_data.print_debug(i, Constants::TAG, ESPHOME_LOG_LEVEL_DEBUG, this->use_fahrenheit_);
+      rx_data.print_debug(RX_MESSAGE_LENGTH, Constants::TAG, ESPHOME_LOG_LEVEL_DEBUG, this->use_fahrenheit_);
       // Don't parse responses to SET or FOLLOW_ME commands to avoid
       // overwriting the mode we just set. The AC state will be updated
       // on subsequent QUERY cycles.
@@ -208,21 +251,19 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
         }
       }
     } else {
-      // Distinguish a true no-reply from a corrupt/partial frame. On a silent
-      // bus (wrong unit address, miswired/unterminated bus, or no unit present)
-      // this branch fires every poll cycle, so logging the expected 0-byte case
-      // at WARN would spam a warning every ~second. Log no-reply at DEBUG and
-      // reserve WARN for an actual short/over-long frame, which is genuinely
+      // Distinguish a true no-reply from a window with bytes but no usable
+      // frame. On a silent bus (wrong unit address, miswired/unterminated bus,
+      // or no unit present) this branch fires every poll cycle, so logging the
+      // expected 0-byte case at WARN would spam a warning every ~second. Log
+      // no-reply at DEBUG and reserve WARN for a window that carried bytes in
+      // which no valid frame from the polled unit could be found (noise, a
+      // frame from another unit, or an unknown dialect), which is genuinely
       // suspicious and worth surfacing.
-      if (i == 0) {
+      if (n == 0) {
         ESP_LOGD(Constants::TAG, "No response for command %02X", cmdSent);
-      } else if (i == RX_MESSAGE_LENGTH) {
-        ESP_LOGW(Constants::TAG, "Response from unit 0x%02X while polling 0x%02X for Command %02X; ignoring",
-                 rx_data.message.frame.header.source, this->address_, cmdSent);
       } else {
-        ESP_LOGW(Constants::TAG, "Bad response length (%u bytes, expected %u) for Command %02X; resyncing",
-                 i, RX_MESSAGE_LENGTH, cmdSent);
-        rx_data.print_debug(i, Constants::TAG, ESPHOME_LOG_LEVEL_WARN);
+        ESP_LOGW(Constants::TAG, "No valid frame from unit 0x%02X in %u byte(s) for Command %02X; resyncing",
+                 this->address_, static_cast<unsigned>(n), cmdSent);
       }
       // Recover instead of deadlocking in WAIT_DATA: a missed, short, or
       // over-long reply must not strand the state machine. Honor any queued
