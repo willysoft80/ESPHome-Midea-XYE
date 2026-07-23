@@ -109,6 +109,22 @@ constexpr size_t RX_OFFSET_SOURCE = 4;
 /// dialect-specific and are zeroed when a standard frame is synthesized from the
 /// head. Observed on Clivet IB3-XY 53M (Midea OEM) cassettes.
 constexpr size_t RX_EXTENDED_TRUSTED_HEAD = 24;
+/// Head-only acceptance: some units transmit a second frame back-to-back after
+/// the response with no inter-frame gap; the receiving UART loses bit sync at
+/// the junction, garbling everything past the head - including the real CRC.
+/// The head arrives intact (observed: never corrupted before this offset, which
+/// covers mode, fan, setpoint, all temperatures, timers and the compressor
+/// flag), so a structurally-verified head is accepted and the unverifiable
+/// remainder zeroed. Trust ends at mode_flags (byte 20).
+constexpr size_t RX_HEADONLY_TRUSTED_LENGTH = 21;
+/// Receive-frame byte offsets used by the head-only structural check.
+constexpr size_t RX_OFFSET_COMMAND = 1;
+constexpr size_t RX_OFFSET_DIRECTION = 2;
+constexpr size_t RX_OFFSET_DESTINATION1 = 3;
+constexpr size_t RX_OFFSET_DESTINATION2 = 5;
+/// Bit 7 of the direction byte is a per-unit "this is a reply" marker; mask it
+/// off before comparing (mirrors ReceiveData::is_valid()).
+constexpr uint8_t RX_DIRECTION_REPLY_MASK = 0x7F;
 /// Maximum consecutive busy-retries within one poll cycle. Past this the cycle is
 /// skipped and the next scheduled update() starts over. Bounds scheduler load when
 /// many instances share one bus.
@@ -273,10 +289,11 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   void release_bus_();
   uint8_t bus_retry_count_{0};
   // Scan a drained poll window for a response from the polled unit: accepts a
-  // standard 32-byte frame at any offset, or an extended variable-length frame
-  // (same head layout, extra payload, CRC+prologue at the very end) from which a
-  // standard frame is synthesized. Fills rx_data and returns true on success.
-  bool extract_frame_(const uint8_t *buf, size_t n);
+  // standard 32-byte frame at any offset, an extended variable-length frame
+  // (same head layout, extra payload, CRC+prologue at the very end), or - as a
+  // last resort - a structurally-verified head whose tail was garbled by an
+  // inter-frame bit-sync loss. Fills rx_data and returns true on success.
+  bool extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent);
 
  protected:
   uart::UARTComponent *uart_;

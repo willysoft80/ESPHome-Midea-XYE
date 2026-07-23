@@ -37,9 +37,10 @@ void ClimateMideaXYE::release_bus_() {
   }
 }
 
-bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n) {
+bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent) {
   if (n < RX_MESSAGE_LENGTH)
     return false;
+  // Pass 1: CRC-verified frames only.
   for (size_t off = 0; off + RX_MESSAGE_LENGTH <= n; off++) {
     if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
       continue;
@@ -50,10 +51,9 @@ bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n) {
     if (rx_data.is_valid())
       return true;
     // Extended variable-length frame: same head layout, dialect-specific extra
-    // payload, CRC and prologue only at the very end (observed ~55-64 bytes on
-    // Clivet IB3-XY 53M cassettes). Accept when the whole span checksums, then
-    // synthesize a standard frame from the trusted head so ParseResponse can
-    // treat it like any other response.
+    // payload, CRC and prologue only at the very end. Accept when the whole
+    // span checksums, then synthesize a standard frame from the trusted head so
+    // ParseResponse can treat it like any other response.
     for (size_t end = off + RX_MESSAGE_LENGTH + 1; end <= n; end++) {
       if (buf[end - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
         continue;
@@ -67,6 +67,34 @@ bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n) {
       ESP_LOGD(Constants::TAG, "Accepted extended %u-byte response from unit 0x%02X", span, this->address_);
       return true;
     }
+  }
+  // Pass 2 (fallback): head-only acceptance. Some units (observed: Clivet
+  // IB3-XY 53M) transmit a second frame back-to-back after the response with no
+  // inter-frame gap; the UART loses bit sync at the junction and everything
+  // past the head - including the real CRC - is garbled beyond recovery. The
+  // head itself arrives intact on every poll, so accept it when it passes a
+  // strict structural check AND the burst still ends with the protocol
+  // terminator, then zero the unverifiable remainder.
+  for (size_t off = 0; off + RX_HEADONLY_TRUSTED_LENGTH <= n; off++) {
+    if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
+      continue;
+    if (buf[off + RX_OFFSET_COMMAND] != cmd_sent)
+      continue;  // responses echo the command byte
+    if ((buf[off + RX_OFFSET_DIRECTION] & RX_DIRECTION_REPLY_MASK) != static_cast<uint8_t>(TO_CLIENT))
+      continue;
+    if (buf[off + RX_OFFSET_DESTINATION1] != 0x00 || buf[off + RX_OFFSET_DESTINATION2] != 0x00)
+      continue;  // replies are addressed to the master (ID 0x00)
+    if (buf[off + RX_OFFSET_SOURCE] != this->address_)
+      continue;
+    if (buf[n - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
+      continue;  // burst must still end with the protocol terminator
+    memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
+    memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+    rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+    rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+    ESP_LOGD(Constants::TAG, "Accepted head-only response (%u of %u bytes) from unit 0x%02X",
+             static_cast<unsigned>(RX_HEADONLY_TRUSTED_LENGTH), static_cast<unsigned>(n), this->address_);
+    return true;
   }
   return false;
 }
@@ -215,7 +243,7 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
     this->release_bus_();
     // extract_frame_ also enforces the Source ID (response byte 4), so on a
     // shared bus a frame from any other unit is never accepted.
-    if (this->extract_frame_(buf, n)) {
+    if (this->extract_frame_(buf, n, cmdSent)) {
       // The configured address answered: the bus is responsive, clear the miss
       // counter so a transient gap never accumulates toward a needless sweep.
       this->miss_count_ = 0;
