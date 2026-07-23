@@ -9,6 +9,9 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
+
+#include <utility>
+#include <vector>
 #ifdef USE_BINARY_SENSOR
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #endif
@@ -90,6 +93,42 @@ constexpr uint8_t CAPABILITIES_SWING = static_cast<uint8_t>(xye::Capabilities::S
 /// Precision step for `current_temperature` reported to Home Assistant (0.01 °C → 2 decimal places).
 /// Applies to both the XYE-bus internal temperature and any external follow_me sensor value.
 constexpr float VISUAL_CURRENT_TEMPERATURE_STEP = 0.01f;
+
+/// Delay before retrying a poll cycle that found the shared RS-485 bus claimed by
+/// another climate instance (multiple indoor units on one UART). Slightly longer
+/// than the default 100 ms response timeout, so the competing transaction has
+/// completed by the time the retry fires.
+constexpr uint32_t BUS_BUSY_RETRY_DELAY_MS = 150;
+/// Scratch size for scanning a poll window for a response frame; sized for the
+/// longest observed extended response (~64 bytes) with margin.
+constexpr size_t BUS_RX_SCAN_BUFFER_SIZE = 96;
+/// Receive-frame byte offset of the Source ID (the answering unit's address).
+constexpr size_t RX_OFFSET_SOURCE = 4;
+/// Extended (variable-length) responses share the standard layout only for the
+/// leading bytes (through the 16-bit error flags); fields beyond this offset are
+/// dialect-specific and are zeroed when a standard frame is synthesized from the
+/// head. Observed on Clivet IB3-XY 53M (Midea OEM) cassettes.
+constexpr size_t RX_EXTENDED_TRUSTED_HEAD = 24;
+/// Head-only acceptance: some units transmit a second frame back-to-back after
+/// the response with no inter-frame gap; the receiving UART loses bit sync at
+/// the junction, garbling everything past the head - including the real CRC.
+/// The head arrives intact (observed: never corrupted before this offset, which
+/// covers mode, fan, setpoint, all temperatures, timers and the compressor
+/// flag), so a structurally-verified head is accepted and the unverifiable
+/// remainder zeroed. Trust ends at mode_flags (byte 20).
+constexpr size_t RX_HEADONLY_TRUSTED_LENGTH = 21;
+/// Receive-frame byte offsets used by the head-only structural check.
+constexpr size_t RX_OFFSET_COMMAND = 1;
+constexpr size_t RX_OFFSET_DIRECTION = 2;
+constexpr size_t RX_OFFSET_DESTINATION1 = 3;
+constexpr size_t RX_OFFSET_DESTINATION2 = 5;
+/// Bit 7 of the direction byte is a per-unit "this is a reply" marker; mask it
+/// off before comparing (mirrors ReceiveData::is_valid()).
+constexpr uint8_t RX_DIRECTION_REPLY_MASK = 0x7F;
+/// Maximum consecutive busy-retries within one poll cycle. Past this the cycle is
+/// skipped and the next scheduled update() starts over. Bounds scheduler load when
+/// many instances share one bus.
+constexpr uint8_t BUS_BUSY_MAX_RETRIES = 4;
 
 constexpr uint8_t OP_FLAG_WATER_PUMP = static_cast<uint8_t>(xye::OperationFlags::WATER_PUMP);
 constexpr uint8_t OP_FLAG_WATER_LOCK = static_cast<uint8_t>(xye::OperationFlags::WATER_LOCK);
@@ -237,6 +276,24 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // ignored after we issue a SET. Prevents a transient mode flap
   // (e.g. cool -> off -> cool) while the unit acknowledges the new mode.
   uint8_t post_set_grace_{0};
+  // --- Shared-bus arbitration (multiple climate instances on one UART) ---
+  // The XYE bus is master/slave: a real CCM polls units strictly one at a time.
+  // Multiple instances of this component on one uart each poll on their own
+  // schedule, so without coordination their frames overlap on the wire and their
+  // read windows drain each other's bytes from the shared RX buffer. ESPHome is
+  // single-threaded, so a static claim registry suffices: an instance claims the
+  // bus for its whole send+read transaction and releases it in the read callback;
+  // an instance that finds the bus busy retries shortly instead of transmitting.
+  static std::vector<std::pair<uart::UARTComponent *, ClimateMideaXYE *>> bus_claims_;
+  bool try_claim_bus_();
+  void release_bus_();
+  uint8_t bus_retry_count_{0};
+  // Scan a drained poll window for a response from the polled unit: accepts a
+  // standard 32-byte frame at any offset, an extended variable-length frame
+  // (same head layout, extra payload, CRC+prologue at the very end), or - as a
+  // last resort - a structurally-verified head whose tail was garbled by an
+  // inter-frame bit-sync loss. Fills rx_data and returns true on success.
+  bool extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent);
 
  protected:
   uart::UARTComponent *uart_;

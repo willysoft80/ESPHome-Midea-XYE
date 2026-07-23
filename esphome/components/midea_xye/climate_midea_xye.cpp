@@ -4,6 +4,8 @@
 
 #include "esphome/core/log.h"
 
+#include <cstring>
+
 namespace esphome {
 namespace midea {
 namespace xye {
@@ -12,6 +14,90 @@ const char *const Constants::TAG = "midea_xye";
 const char *const Constants::FREEZE_PROTECTION = "Freeze Protection";
 const char *const Constants::SILENT = "Silent";
 const char *const Constants::TURBO = "Turbo";
+
+std::vector<std::pair<uart::UARTComponent *, ClimateMideaXYE *>> ClimateMideaXYE::bus_claims_{};
+
+bool ClimateMideaXYE::try_claim_bus_() {
+  for (auto &claim : bus_claims_) {
+    if (claim.first == this->uart_) {
+      if (claim.second != nullptr && claim.second != this)
+        return false;  // another instance is mid-transaction on this bus
+      claim.second = this;
+      return true;
+    }
+  }
+  bus_claims_.emplace_back(this->uart_, this);
+  return true;
+}
+
+void ClimateMideaXYE::release_bus_() {
+  for (auto &claim : bus_claims_) {
+    if (claim.first == this->uart_ && claim.second == this)
+      claim.second = nullptr;
+  }
+}
+
+bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent) {
+  if (n < RX_MESSAGE_LENGTH)
+    return false;
+  // Pass 1: CRC-verified frames only.
+  for (size_t off = 0; off + RX_MESSAGE_LENGTH <= n; off++) {
+    if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
+      continue;
+    if (buf[off + RX_OFFSET_SOURCE] != this->address_)
+      continue;
+    // Standard fixed-length frame at this offset?
+    memcpy(rx_data.raw, &buf[off], RX_MESSAGE_LENGTH);
+    if (rx_data.is_valid())
+      return true;
+    // Extended variable-length frame: same head layout, dialect-specific extra
+    // payload, CRC and prologue only at the very end. Accept when the whole
+    // span checksums, then synthesize a standard frame from the trusted head so
+    // ParseResponse can treat it like any other response.
+    for (size_t end = off + RX_MESSAGE_LENGTH + 1; end <= n; end++) {
+      if (buf[end - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
+        continue;
+      const uint8_t span = static_cast<uint8_t>(end - off);
+      if (buf[end - 2] != compute_protocol_crc(&buf[off], span))
+        continue;
+      memcpy(rx_data.raw, &buf[off], RX_EXTENDED_TRUSTED_HEAD);
+      memset(rx_data.raw + RX_EXTENDED_TRUSTED_HEAD, 0, RX_MESSAGE_LENGTH - RX_EXTENDED_TRUSTED_HEAD);
+      rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+      rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+      ESP_LOGD(Constants::TAG, "Accepted extended %u-byte response from unit 0x%02X", span, this->address_);
+      return true;
+    }
+  }
+  // Pass 2 (fallback): head-only acceptance. Some units (observed: Clivet
+  // IB3-XY 53M) transmit a second frame back-to-back after the response with no
+  // inter-frame gap; the UART loses bit sync at the junction and everything
+  // past the head - including the real CRC - is garbled beyond recovery. The
+  // head itself arrives intact on every poll, so accept it when it passes a
+  // strict structural check AND the burst still ends with the protocol
+  // terminator, then zero the unverifiable remainder.
+  for (size_t off = 0; off + RX_HEADONLY_TRUSTED_LENGTH <= n; off++) {
+    if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
+      continue;
+    if (buf[off + RX_OFFSET_COMMAND] != cmd_sent)
+      continue;  // responses echo the command byte
+    if ((buf[off + RX_OFFSET_DIRECTION] & RX_DIRECTION_REPLY_MASK) != static_cast<uint8_t>(TO_CLIENT))
+      continue;
+    if (buf[off + RX_OFFSET_DESTINATION1] != 0x00 || buf[off + RX_OFFSET_DESTINATION2] != 0x00)
+      continue;  // replies are addressed to the master (ID 0x00)
+    if (buf[off + RX_OFFSET_SOURCE] != this->address_)
+      continue;
+    if (buf[n - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
+      continue;  // burst must still end with the protocol terminator
+    memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
+    memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+    rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+    rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+    ESP_LOGD(Constants::TAG, "Accepted head-only response (%u of %u bytes) from unit 0x%02X",
+             static_cast<unsigned>(RX_HEADONLY_TRUSTED_LENGTH), static_cast<unsigned>(n), this->address_);
+    return true;
+  }
+  return false;
+}
 
 static void set_sensor(Sensor *sensor, float value) {
   if (sensor != nullptr && (!sensor->has_state() || sensor->get_raw_state() != value))
@@ -125,6 +211,11 @@ void ClimateMideaXYE::setTransmitParams() {
 void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
   // TODO: Reimplement flow control for manual RS485 flow control chips
   // digitalWrite(ComControlPin, RS485_TX_PIN_VALUE);
+  // Drop any stale bytes (a late reply to a previous poll, or another unit's
+  // traffic) so the read window below only ever sees this frame's response.
+  uint8_t stale;
+  while (this->uart_->available())
+    this->uart_->read_byte(&stale);
   // Log outgoing message at debug level
   tx_data.print_debug(Constants::TAG, TX_MESSAGE_LENGTH, ESPHOME_LOG_LEVEL_DEBUG);
   this->uart_->write_array(tx_data.raw, TX_MESSAGE_LENGTH);
@@ -134,13 +225,25 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
   this->set_timeout("read-result", this->response_timeout, [this, cmdSent]() {
     // digitalWrite(ComControlPin, RS485_RX_PIN_VALUE);
 
-    uint8_t i = 0;
+    // Read the whole window into a scratch buffer, then SCAN it for a response
+    // frame instead of assuming the buffer holds exactly one fixed-length frame:
+    // some units answer with extra bytes around/after the standard response.
+    uint8_t buf[BUS_RX_SCAN_BUFFER_SIZE];
+    size_t n = 0;
+    uint8_t discard;
     while (this->uart_->available()) {
-      if (i < RX_MESSAGE_LENGTH)
-        this->uart_->read_byte(&rx_data.raw[i]);
-      i++;
+      if (n < sizeof(buf)) {
+        this->uart_->read_byte(&buf[n]);
+        n++;
+      } else {
+        this->uart_->read_byte(&discard);
+      }
     }
-    if (i == RX_MESSAGE_LENGTH) {
+    // Transaction over either way: free the bus for any other instance.
+    this->release_bus_();
+    // extract_frame_ also enforces the Source ID (response byte 4), so on a
+    // shared bus a frame from any other unit is never accepted.
+    if (this->extract_frame_(buf, n, cmdSent)) {
       // The configured address answered: the bus is responsive, clear the miss
       // counter so a transient gap never accumulates toward a needless sweep.
       this->miss_count_ = 0;
@@ -149,7 +252,7 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       // (i.e. one that never triggered an auto-discovery sweep).
       this->publish_discovered_address_();
       // Log incoming message at debug level
-      rx_data.print_debug(i, Constants::TAG, ESPHOME_LOG_LEVEL_DEBUG, this->use_fahrenheit_);
+      rx_data.print_debug(RX_MESSAGE_LENGTH, Constants::TAG, ESPHOME_LOG_LEVEL_DEBUG, this->use_fahrenheit_);
       // Don't parse responses to SET or FOLLOW_ME commands to avoid
       // overwriting the mode we just set. The AC state will be updated
       // on subsequent QUERY cycles.
@@ -176,18 +279,19 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
         }
       }
     } else {
-      // Distinguish a true no-reply from a corrupt/partial frame. On a silent
-      // bus (wrong unit address, miswired/unterminated bus, or no unit present)
-      // this branch fires every poll cycle, so logging the expected 0-byte case
-      // at WARN would spam a warning every ~second. Log no-reply at DEBUG and
-      // reserve WARN for an actual short/over-long frame, which is genuinely
+      // Distinguish a true no-reply from a window with bytes but no usable
+      // frame. On a silent bus (wrong unit address, miswired/unterminated bus,
+      // or no unit present) this branch fires every poll cycle, so logging the
+      // expected 0-byte case at WARN would spam a warning every ~second. Log
+      // no-reply at DEBUG and reserve WARN for a window that carried bytes in
+      // which no valid frame from the polled unit could be found (noise, a
+      // frame from another unit, or an unknown dialect), which is genuinely
       // suspicious and worth surfacing.
-      if (i == 0) {
+      if (n == 0) {
         ESP_LOGD(Constants::TAG, "No response for command %02X", cmdSent);
       } else {
-        ESP_LOGW(Constants::TAG, "Bad response length (%u bytes, expected %u) for Command %02X; resyncing",
-                 i, RX_MESSAGE_LENGTH, cmdSent);
-        rx_data.print_debug(i, Constants::TAG, ESPHOME_LOG_LEVEL_WARN);
+        ESP_LOGW(Constants::TAG, "No valid frame from unit 0x%02X in %u byte(s) for Command %02X; resyncing",
+                 this->address_, static_cast<unsigned>(n), cmdSent);
       }
       // Recover instead of deadlocking in WAIT_DATA: a missed, short, or
       // over-long reply must not strand the state machine. Honor any queued
@@ -227,6 +331,12 @@ void ClimateMideaXYE::send_probe_() {
   // per address independent of the (slower) poll period; normal polling stays
   // suspended (see update()) so only one frame is ever in flight.
   //
+  // Probes respect shared-bus arbitration too: on a bus with several instances,
+  // never transmit a probe over another instance's pending reply.
+  if (!this->try_claim_bus_()) {
+    this->set_timeout("discover-gap", BUS_BUSY_RETRY_DELAY_MS, [this]() { this->send_probe_(); });
+    return;
+  }
   // Drop any stale bytes first (e.g. a late reply to the previous probe) so this
   // probe's read window only sees a response to this address.
   uint8_t stale;
@@ -244,6 +354,9 @@ void ClimateMideaXYE::send_probe_() {
         this->uart_->read_byte(&this->rx_data.raw[i]);
       i++;
     }
+    // Probe transaction over: free the bus between probes so other instances
+    // can interleave their polls with a (possibly long) address sweep.
+    this->release_bus_();
     const bool found = (i == RX_MESSAGE_LENGTH) && this->rx_data.is_valid() &&
                        (this->rx_data.message.frame.header.source == this->scan_addr_);
     if (found) {
@@ -282,6 +395,20 @@ void ClimateMideaXYE::update() {
   // suspend the normal poll cycle so there is never more than one frame in flight.
   if (this->discovering_)
     return;
+  // Shared-bus arbitration: when several instances poll units on one UART, only
+  // one transaction may be in flight — like a real CCM polling one unit at a time.
+  // If another instance holds the bus, retry shortly instead of transmitting over
+  // its pending reply.
+  if (controlState != ControlState::WAIT_DATA && !this->try_claim_bus_()) {
+    if (this->bus_retry_count_ < BUS_BUSY_MAX_RETRIES) {
+      this->bus_retry_count_++;
+      this->set_timeout("bus-retry", BUS_BUSY_RETRY_DELAY_MS, [this]() { this->update(); });
+    } else {
+      this->bus_retry_count_ = 0;  // give up this cycle; the next poll starts over
+    }
+    return;
+  }
+  this->bus_retry_count_ = 0;
   // Possible States:
   // 0: Waiting for Response from Command
   // 1: Sending Set C3 Command
