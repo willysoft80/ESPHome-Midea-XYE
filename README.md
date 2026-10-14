@@ -213,6 +213,12 @@ climate:
     sync_fan_mode_from_device: false  # Optional. Opt-in: update the HA fan mode from the
                                       # physical thermostat's commanded speed (C4 packet).
                                       # Default false (HA fan mode only changes on HA commands).
+    extended_query: true        # Optional. Poll the C4 (extended) frame after every C0.
+                                # Set false for units whose C4 reply is not understood:
+                                # each unit is then read twice as often. Needs
+                                # target_temperature_from_c0: true and rules out
+                                # outdoor_temperature, static_pressure and
+                                # sync_fan_mode_from_device. Default true.
 ```
 
 ## Debugging
