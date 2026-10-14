@@ -93,12 +93,20 @@ climate:
       name: Defrost Active
     compressor_active:          # Optional. True while the compressor is running
       name: Compressor Active
+    communication:              # Optional. On while the unit answers polls; off after
+      name: Communication       # ~10 consecutive failed polls (unit off the bus)
     compressor_aware_action: false  # Optional. Opt-in: derive heating/cooling/idle action
                                     # from the compressor + defrost state. Default false
                                     # (legacy: fan running implies heating/cooling).
     sync_fan_mode_from_device: false  # Optional. Opt-in: update the HA fan mode from the
                                       # physical thermostat's commanded speed (C4 packet).
                                       # Default false (HA fan mode only changes on HA commands).
+    extended_query: true        # Optional. Poll the C4 (extended) frame after every C0.
+                                # Set false for units whose C4 reply is not understood:
+                                # each unit is then read twice as often. Needs
+                                # target_temperature_from_c0: true and rules out
+                                # outdoor_temperature, static_pressure and
+                                # sync_fan_mode_from_device. Default true.
 
 ```
 

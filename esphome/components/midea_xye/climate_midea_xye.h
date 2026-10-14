@@ -10,6 +10,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
 
+#include <cstddef>
 #include <utility>
 #include <vector>
 #ifdef USE_BINARY_SENSOR
@@ -117,6 +118,22 @@ constexpr size_t RX_EXTENDED_TRUSTED_HEAD = 24;
 /// flag), so a structurally-verified head is accepted and the unverifiable
 /// remainder zeroed. Trust ends at mode_flags (byte 20).
 constexpr size_t RX_HEADONLY_TRUSTED_LENGTH = 21;
+/// Receive-frame byte offsets of the fields that lie past the head-only trusted
+/// length (and, for some, past the extended trusted head). Derived from the
+/// packed frame structs so they cannot drift from the layout. A field is only
+/// published when the accepted frame actually carried it (see rx_trusted_len_);
+/// otherwise it would be the synthesized zero, not a reading.
+constexpr size_t RX_OFFSET_C0_ERROR_FLAGS = sizeof(xye::ReceiveMessageFrame) + offsetof(xye::QueryResponseData, error_flags);
+constexpr size_t RX_OFFSET_C0_PROTECT_FLAGS =
+    sizeof(xye::ReceiveMessageFrame) + offsetof(xye::QueryResponseData, protect_flags);
+constexpr size_t RX_OFFSET_C4_OUTDOOR_TEMPERATURE =
+    sizeof(xye::ReceiveMessageFrame) + offsetof(xye::ExtendedQueryResponseData, outdoor_temperature);
+constexpr size_t RX_OFFSET_C4_STATIC_PRESSURE =
+    sizeof(xye::ReceiveMessageFrame) + offsetof(xye::ExtendedQueryResponseData, static_pressure);
+static_assert(RX_OFFSET_C0_ERROR_FLAGS + sizeof(xye::Flags16) == RX_EXTENDED_TRUSTED_HEAD,
+              "the extended trusted head ends with the C0 error flags");
+static_assert(RX_OFFSET_C4_OUTDOOR_TEMPERATURE == RX_HEADONLY_TRUSTED_LENGTH,
+              "the C4 outdoor temperature is the first byte past the head-only trusted length");
 /// Receive-frame byte offsets used by the head-only structural check.
 constexpr size_t RX_OFFSET_COMMAND = 1;
 constexpr size_t RX_OFFSET_DIRECTION = 2;
@@ -125,6 +142,11 @@ constexpr size_t RX_OFFSET_DESTINATION2 = 5;
 /// Bit 7 of the direction byte is a per-unit "this is a reply" marker; mask it
 /// off before comparing (mirrors ReceiveData::is_valid()).
 constexpr uint8_t RX_DIRECTION_REPLY_MASK = 0x7F;
+/// Consecutive failed transactions (no reply, or no valid frame from the unit)
+/// before the optional `communication` binary sensor reports the unit offline.
+/// At the default 1 s period this is ~10 s, so an occasional garbled reply on a
+/// noisy bus does not flap the sensor.
+constexpr uint16_t COMMUNICATION_LOST_AFTER_MISSES = 10;
 /// Maximum consecutive busy-retries within one poll cycle. Past this the cycle is
 /// skipped and the next scheduled update() starts over. Bounds scheduler load when
 /// many instances share one bus.
@@ -194,6 +216,7 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   void set_compressor_active_sensor(binary_sensor::BinarySensor *sensor) {
     this->compressor_active_sensor_ = sensor;
   }
+  void set_communication_sensor(binary_sensor::BinarySensor *sensor) { this->communication_sensor_ = sensor; }
 #endif
   void set_follow_me_sensor(Sensor *sensor);
   void set_internal_current_temperature_sensor(Sensor *sensor) { this->internal_current_temperature_sensor_ = sensor; }
@@ -206,6 +229,8 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   /// C4 (QUERY_EXTENDED). For units that never answer C4 and would otherwise report a null
   /// target temperature. The C4 handler skips its target read while this is enabled.
   void set_target_temperature_from_c0(bool yesno) { this->target_temperature_from_c0_ = yesno; }
+  /// When false, the poll cycle is C0 only: no C4 (QUERY_EXTENDED) frame is sent.
+  void set_extended_query(bool yesno) { this->extended_query_ = yesno; }
   void set_static_pressure_number(StaticPressureNumber *number) {
     this->static_pressure_number_ = number;
     number->set_parent(this);
@@ -267,15 +292,35 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   uint16_t miss_count_{0};          // consecutive unanswered polls (normal mode)
   bool discovering_{false};         // true while a sweep is in progress
   uint8_t scan_addr_{0x00};         // address currently being probed
+  // Consecutive failed transactions, counted whether or not auto_discover is on
+  // (miss_count_ only counts while it is). Drives the communication sensor.
+  uint16_t comm_misses_{0};
   // Tracks whether Follow-Me has been initialized after mode change.
   // When false, the next Follow-Me update sends an INIT subcommand (0x06).
   // When true, Follow-Me updates send a regular UPDATE subcommand (0x02).
   bool followMeInit;
   uint8_t lastFollowMeTemperature;
+  // Fill tx_data with a Follow-Me (0xC6) frame carrying @p temperature (°C).
+  void build_follow_me_frame_(uint8_t temperature);
+  // After a SET: build the Follow-Me refresh and return true, or return false
+  // when there is nothing to refresh (no follow-me sensor reading, unit off,
+  // IR build).
+  bool prepare_follow_me_after_set_();
   // Number of upcoming QUERY responses whose reported mode should be
   // ignored after we issue a SET. Prevents a transient mode flap
   // (e.g. cool -> off -> cool) while the unit acknowledges the new mode.
   uint8_t post_set_grace_{0};
+  // True while a SET is waiting to be transmitted (either next in line or
+  // queued behind an in-flight transaction). Other commands must not replace it.
+  bool set_pending_() const {
+    return controlState == ControlState::SEND_SET || queuedCommand == ControlState::SEND_SET;
+  }
+  // Follow-Me / static-pressure requests that arrived while a SET was pending.
+  // They go out right after that SET (send_deferred_()), never in its place.
+  bool follow_me_deferred_{false};
+  bool static_pressure_deferred_{false};
+  uint8_t deferred_static_pressure_{0};
+  void send_deferred_();
   // --- Shared-bus arbitration (multiple climate instances on one UART) ---
   // The XYE bus is master/slave: a real CCM polls units strictly one at a time.
   // Multiple instances of this component on one uart each poll on their own
@@ -294,6 +339,15 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // last resort - a structurally-verified head whose tail was garbled by an
   // inter-frame bit-sync loss. Fills rx_data and returns true on success.
   bool extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent);
+  // Structural check of a reply head at p (see extract_frame_).
+  bool reply_head_ok_(const uint8_t *p, uint8_t cmd_sent) const;
+  // Copy of the frame last put on the wire, to recognise a transceiver echo.
+  uint8_t last_tx_[TX_MESSAGE_LENGTH]{};
+  // Number of leading bytes of rx_data that came off the wire (and were covered
+  // by the acceptance check). Bytes past it were zero-filled by extract_frame_.
+  size_t rx_trusted_len_{RX_MESSAGE_LENGTH};
+  // True when the field at [offset, offset + size) was received, not synthesized.
+  bool rx_trusted_(size_t offset, size_t size) const { return offset + size <= this->rx_trusted_len_; }
 
  protected:
   uart::UARTComponent *uart_;
@@ -317,6 +371,9 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // Opt-in (target_temperature_from_c0 YAML option): when true, the setpoint is read from the
   // C0 (QUERY) response instead of C4 (QUERY_EXTENDED), for units that never answer C4.
   bool target_temperature_from_c0_{false};
+  // extended_query YAML option: poll C4 after every C0 (default). The schema only
+  // allows false together with target_temperature_from_c0 and no C4-fed option.
+  bool extended_query_{true};
   Sensor *outdoor_sensor_{nullptr};
   Sensor *fan_speed_sensor_{nullptr};
   Sensor *temperature_2a_sensor_{nullptr};
@@ -332,6 +389,8 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
 #ifdef USE_BINARY_SENSOR
   binary_sensor::BinarySensor *defrost_sensor_{nullptr};
   binary_sensor::BinarySensor *compressor_active_sensor_{nullptr};
+  // On while the unit answers; off after COMMUNICATION_LOST_AFTER_MISSES failures.
+  binary_sensor::BinarySensor *communication_sensor_{nullptr};
 #endif
   Sensor *follow_me_sensor_{nullptr};
   Sensor *internal_current_temperature_sensor_{nullptr};

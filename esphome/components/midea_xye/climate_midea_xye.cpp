@@ -37,36 +37,76 @@ void ClimateMideaXYE::release_bus_() {
   }
 }
 
+bool ClimateMideaXYE::reply_head_ok_(const uint8_t *p, uint8_t cmd_sent) const {
+  // A reply echoes the command, marks itself as unit -> master, is addressed to
+  // the master on both destination bytes and carries the polled unit's ID.
+  return p[0] == static_cast<uint8_t>(ProtocolMarker::PREAMBLE) &&
+         p[RX_OFFSET_COMMAND] == cmd_sent &&  // responses echo the command byte
+         (p[RX_OFFSET_DIRECTION] & RX_DIRECTION_REPLY_MASK) == static_cast<uint8_t>(TO_CLIENT) &&
+         // replies are addressed to the master (ID 0x00)
+         p[RX_OFFSET_DESTINATION1] == CLIENT_ID && p[RX_OFFSET_DESTINATION2] == CLIENT_ID &&
+         p[RX_OFFSET_SOURCE] == this->address_;
+}
+
 bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent) {
   if (n < RX_MESSAGE_LENGTH)
     return false;
+  // The reply starts at the first head that passes the structural check. Later
+  // heads in the same window - the start of a second frame sent back-to-back
+  // (observed: Clivet IB3-XY 53M), or noise - are never considered: a chance
+  // checksum match on them would publish garbage as a reading.
+  size_t off = 0;
+  while (off + RX_HEADONLY_TRUSTED_LENGTH <= n) {
+    // A transceiver that echoes the master's own frame puts it first in the
+    // window, and at address 0x00 its head reads like a reply: skip it.
+    if (off + TX_MESSAGE_LENGTH <= n && memcmp(&buf[off], this->last_tx_, TX_MESSAGE_LENGTH) == 0) {
+      off += TX_MESSAGE_LENGTH;
+      continue;
+    }
+    if (this->reply_head_ok_(&buf[off], cmd_sent))
+      break;
+    off++;
+  }
+  if (off + RX_HEADONLY_TRUSTED_LENGTH > n)
+    return false;
   // Pass 1: CRC-verified frames only.
-  for (size_t off = 0; off + RX_MESSAGE_LENGTH <= n; off++) {
-    if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
-      continue;
-    if (buf[off + RX_OFFSET_SOURCE] != this->address_)
-      continue;
-    // Standard fixed-length frame at this offset?
+  // Standard fixed-length frame at this offset?
+  if (off + RX_MESSAGE_LENGTH <= n) {
     memcpy(rx_data.raw, &buf[off], RX_MESSAGE_LENGTH);
-    if (rx_data.is_valid())
-      return true;
-    // Extended variable-length frame: same head layout, dialect-specific extra
-    // payload, CRC and prologue only at the very end. Accept when the whole
-    // span checksums, then synthesize a standard frame from the trusted head so
-    // ParseResponse can treat it like any other response.
-    for (size_t end = off + RX_MESSAGE_LENGTH + 1; end <= n; end++) {
-      if (buf[end - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
-        continue;
-      const uint8_t span = static_cast<uint8_t>(end - off);
-      if (buf[end - 2] != compute_protocol_crc(&buf[off], span))
-        continue;
-      memcpy(rx_data.raw, &buf[off], RX_EXTENDED_TRUSTED_HEAD);
-      memset(rx_data.raw + RX_EXTENDED_TRUSTED_HEAD, 0, RX_MESSAGE_LENGTH - RX_EXTENDED_TRUSTED_HEAD);
-      rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
-      rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
-      ESP_LOGD(Constants::TAG, "Accepted extended %u-byte response from unit 0x%02X", span, this->address_);
+    if (rx_data.is_valid()) {
+      this->rx_trusted_len_ = RX_MESSAGE_LENGTH;
+      // More bytes after a checksum-valid frame mean a burst (observed: Clivet
+      // IB3-XY 53M), where the one-byte checksum can match garbled bytes by
+      // chance: trust only the head then, so a fluke never latches a value.
+      if (off + RX_MESSAGE_LENGTH != n) {
+        memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+        rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+        rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+        this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
+      }
       return true;
     }
+  }
+  // Extended variable-length frame: same head layout, dialect-specific extra
+  // payload, CRC and prologue only at the very end. Accept when the whole
+  // span checksums, then synthesize a standard frame from the trusted head so
+  // ParseResponse can treat it like any other response.
+  for (size_t end = off + RX_MESSAGE_LENGTH + 1; end <= n; end++) {
+    if (buf[end - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
+      continue;
+    const uint8_t span = static_cast<uint8_t>(end - off);
+    if (buf[end - 2] != compute_protocol_crc(&buf[off], span))
+      continue;
+    // The checksum is one byte and is tried at every terminator in the
+    // window, so a garbled tail matches by chance about once per 256
+    // candidates: only the head is trusted.
+    memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
+    memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+    rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+    rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+    this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
+    ESP_LOGD(Constants::TAG, "Accepted extended %u-byte response from unit 0x%02X", span, this->address_);
+    return true;
   }
   // Pass 2 (fallback): head-only acceptance. Some units (observed: Clivet
   // IB3-XY 53M) transmit a second frame back-to-back after the response with no
@@ -75,28 +115,20 @@ bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_s
   // head itself arrives intact on every poll, so accept it when it passes a
   // strict structural check AND the burst still ends with the protocol
   // terminator, then zero the unverifiable remainder.
-  for (size_t off = 0; off + RX_HEADONLY_TRUSTED_LENGTH <= n; off++) {
-    if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
-      continue;
-    if (buf[off + RX_OFFSET_COMMAND] != cmd_sent)
-      continue;  // responses echo the command byte
-    if ((buf[off + RX_OFFSET_DIRECTION] & RX_DIRECTION_REPLY_MASK) != static_cast<uint8_t>(TO_CLIENT))
-      continue;
-    if (buf[off + RX_OFFSET_DESTINATION1] != 0x00 || buf[off + RX_OFFSET_DESTINATION2] != 0x00)
-      continue;  // replies are addressed to the master (ID 0x00)
-    if (buf[off + RX_OFFSET_SOURCE] != this->address_)
-      continue;
-    if (buf[n - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
-      continue;  // burst must still end with the protocol terminator
-    memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
-    memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
-    rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
-    rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
-    ESP_LOGD(Constants::TAG, "Accepted head-only response (%u of %u bytes) from unit 0x%02X",
-             static_cast<unsigned>(RX_HEADONLY_TRUSTED_LENGTH), static_cast<unsigned>(n), this->address_);
-    return true;
-  }
-  return false;
+  // A lone frame whose checksum failed is not such a burst: its corruption
+  // can be anywhere, head included.
+  if (n <= off + RX_MESSAGE_LENGTH)
+    return false;
+  if (buf[n - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
+    return false;  // burst must still end with the protocol terminator
+  memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
+  memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+  rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+  rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+  this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
+  ESP_LOGD(Constants::TAG, "Accepted head-only response (%u of %u bytes) from unit 0x%02X",
+           static_cast<unsigned>(RX_HEADONLY_TRUSTED_LENGTH), static_cast<unsigned>(n), this->address_);
+  return true;
 }
 
 static void set_sensor(Sensor *sensor, float value) {
@@ -218,11 +250,16 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
     this->uart_->read_byte(&stale);
   // Log outgoing message at debug level
   tx_data.print_debug(Constants::TAG, TX_MESSAGE_LENGTH, ESPHOME_LOG_LEVEL_DEBUG);
+  // The reply echoes the command byte of the frame actually on the wire, which
+  // is not always cmdSent (on the SEND_FOLLOWME step tx_data can still hold
+  // the SET frame). Captured now: tx_data can be rebuilt during WAIT_DATA.
+  const uint8_t wire_cmd = static_cast<uint8_t>(tx_data.message.frame.header.command);
+  memcpy(this->last_tx_, tx_data.raw, TX_MESSAGE_LENGTH);
   this->uart_->write_array(tx_data.raw, TX_MESSAGE_LENGTH);
   this->uart_->flush();
   controlState = ControlState::WAIT_DATA;
   // Delay for response_timeout ms to allow response from the AC unit.
-  this->set_timeout("read-result", this->response_timeout, [this, cmdSent]() {
+  this->set_timeout("read-result", this->response_timeout, [this, cmdSent, wire_cmd]() {
     // digitalWrite(ComControlPin, RS485_RX_PIN_VALUE);
 
     // Read the whole window into a scratch buffer, then SCAN it for a response
@@ -243,10 +280,14 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
     this->release_bus_();
     // extract_frame_ also enforces the Source ID (response byte 4), so on a
     // shared bus a frame from any other unit is never accepted.
-    if (this->extract_frame_(buf, n, cmdSent)) {
+    if (this->extract_frame_(buf, n, wire_cmd)) {
       // The configured address answered: the bus is responsive, clear the miss
       // counter so a transient gap never accumulates toward a needless sweep.
       this->miss_count_ = 0;
+      this->comm_misses_ = 0;
+#ifdef USE_BINARY_SENSOR
+      set_binary_sensor(this->communication_sensor_, true);
+#endif
       // A unit answered at the active address; surface it so the sensor never
       // sits at "Unknown" for a unit that responds at its configured address
       // (i.e. one that never triggered an auto-discovery sweep).
@@ -256,7 +297,13 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       // Don't parse responses to SET or FOLLOW_ME commands to avoid
       // overwriting the mode we just set. The AC state will be updated
       // on subsequent QUERY cycles.
-      if (cmdSent != CLIENT_COMMAND_SET && cmdSent != CLIENT_COMMAND_FOLLOWME) {
+      // Likewise skip a poll response that was already in flight when
+      // control() queued a SET: it carries the unit's state from before the
+      // command, and parsing it would overwrite the requested mode/setpoint/fan
+      // that setTransmitParams() is about to send - the SET would then carry
+      // the old state and the command would be silently lost.
+      if (cmdSent != CLIENT_COMMAND_SET && cmdSent != CLIENT_COMMAND_FOLLOWME &&
+          queuedCommand != ControlState::SEND_SET) {
         ParseResponse();
       }
       if (queuedCommand != ControlState::WAIT_DATA) {
@@ -265,10 +312,13 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       } else {
         switch (cmdSent) {
           case CLIENT_COMMAND_QUERY:
-            controlState = ControlState::SEND_QUERY_EXTENDED;
+            controlState = this->extended_query_ ? ControlState::SEND_QUERY_EXTENDED : ControlState::SEND_QUERY;
             break;
           case CLIENT_COMMAND_SET:
-            controlState = ControlState::SEND_FOLLOWME;
+            // tx_data still holds the SET frame: going to SEND_FOLLOWME without
+            // building a Follow-Me frame would transmit the same SET again.
+            controlState = this->prepare_follow_me_after_set_() ? ControlState::SEND_FOLLOWME
+                                                                : ControlState::SEND_QUERY;
             break;
           case CLIENT_COMMAND_QUERY_EXTENDED:
             controlState = ControlState::SEND_QUERY;
@@ -302,9 +352,29 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       } else {
         controlState = ControlState::SEND_QUERY;
       }
+      if (this->comm_misses_ < COMMUNICATION_LOST_AFTER_MISSES)
+        this->comm_misses_++;
+#ifdef USE_BINARY_SENSOR
+      if (this->comm_misses_ >= COMMUNICATION_LOST_AFTER_MISSES)
+        set_binary_sensor(this->communication_sensor_, false);
+#endif
       // After recovering, count this miss and (if enabled) start an address
       // sweep once the bus has been unresponsive for discovery_after_ cycles.
       this->maybe_start_discovery_();
+    }
+    // The SET has gone out: send what was deferred while it was pending.
+    // If its miss started an address sweep, the SET is not retried, so drop
+    // the deferred requests too instead of replaying them after a later SET.
+    if (cmdSent == CLIENT_COMMAND_SET && !this->set_pending_()) {
+      if (this->discovering_) {
+        if (this->follow_me_deferred_ || this->static_pressure_deferred_) {
+          ESP_LOGD(Constants::TAG, "Unit unresponsive; deferred request dropped");
+        }
+        this->follow_me_deferred_ = false;
+        this->static_pressure_deferred_ = false;
+      } else {
+        this->send_deferred_();
+      }
     }
   });
 }
@@ -319,6 +389,11 @@ void ClimateMideaXYE::maybe_start_discovery_() {
     return;
   this->discovering_ = true;
   this->scan_addr_ = this->scan_min_;
+#ifdef USE_BINARY_SENSOR
+  // Polling pauses during the sweep, so report the lost unit now rather than
+  // leaving the sensor on until a sweep with a low discovery_after ends.
+  set_binary_sensor(this->communication_sensor_, false);
+#endif
   ESP_LOGW(Constants::TAG, "Address 0x%02X unresponsive for %u cycles; scanning 0x%02X-0x%02X for a unit",
            this->address_, this->miss_count_, this->scan_min_, this->scan_max_);
   this->send_probe_();
@@ -382,7 +457,9 @@ void ClimateMideaXYE::finish_discovery_(bool found, uint8_t addr) {
     ESP_LOGW(Constants::TAG, "Address scan found no unit in 0x%02X-0x%02X; resuming polls at 0x%02X",
              this->scan_min_, this->scan_max_, this->address_);
   }
-  this->controlState = ControlState::SEND_QUERY;
+  // A SET requested during the sweep is still pending: send it first.
+  if (!this->set_pending_())
+    this->controlState = ControlState::SEND_QUERY;
 }
 
 void ClimateMideaXYE::publish_discovered_address_() {
@@ -427,6 +504,9 @@ void ClimateMideaXYE::update() {
       // If the AC mode changed, follow-me should be
       // refreshed, if emulating the wired controller's
       // behavior.
+      if (tx_data.message.frame.header.command == Command::FOLLOW_ME &&
+          tx_data.message.data.standard.timer_stop == FOLLOWME_SUBCOMMAND_INIT)
+        followMeInit = true;
       cmdSent = CLIENT_COMMAND_FOLLOWME;
       sendRecv(cmdSent);
       if (this->mode == ClimateMode::CLIMATE_MODE_OFF) {
@@ -524,7 +604,10 @@ void ClimateMideaXYE::ParseResponse() {
         // and defrost_active=false reproduce the legacy "fan running implies heating/cooling".
         const bool compressor_active = !this->compressor_aware_action_ ||
                                        qr.compressor_running_flag == CompressorRunningFlag::ACTIVE;
+        // Protect flags past the trusted bytes are synthesized zeros: treat defrost
+        // as unknown (inactive), exactly as before, rather than as a reading.
         const bool defrost_active = this->compressor_aware_action_ &&
+                                    this->rx_trusted_(RX_OFFSET_C0_PROTECT_FLAGS, sizeof(qr.protect_flags)) &&
                                     XYEAdapter::is_defrost_active(qr.protect_flags.value());
         update_property(this->action,
                         XYEAdapter::get_climate_action(mode, qr.fan_mode, qr.operation_mode,
@@ -555,21 +638,37 @@ void ClimateMideaXYE::ParseResponse() {
       set_sensor(this->current_sensor_, static_cast<float>(qr.current));
       set_sensor(this->timer_start_sensor_, CalculateGetTime(qr.timer_start));
       set_sensor(this->timer_stop_sensor_, CalculateGetTime(qr.timer_stop));
-      set_sensor(this->error_flags_sensor_, static_cast<float>(qr.error_flags.value()));
-      set_sensor(this->protect_flags_sensor_, static_cast<float>(qr.protect_flags.value()));
+      // Error/protect flags lie past the head-only trusted length; on a head-only
+      // or extended frame they were zero-filled, so keep the last real reading
+      // instead of publishing a fake "no error / no protection / no defrost".
+      const bool error_trusted = this->rx_trusted_(RX_OFFSET_C0_ERROR_FLAGS, sizeof(qr.error_flags));
+      const bool protect_trusted = this->rx_trusted_(RX_OFFSET_C0_PROTECT_FLAGS, sizeof(qr.protect_flags));
+      if (error_trusted)
+        set_sensor(this->error_flags_sensor_, static_cast<float>(qr.error_flags.value()));
+      if (protect_trusted)
+        set_sensor(this->protect_flags_sensor_, static_cast<float>(qr.protect_flags.value()));
       set_sensor(this->fan_speed_sensor_, static_cast<float>(XYEAdapter::get_fan_speed_level(qr.fan_mode)));
 #ifdef USE_BINARY_SENSOR
-      set_binary_sensor(this->defrost_sensor_, XYEAdapter::is_defrost_active(qr.protect_flags.value()));
+      if (protect_trusted)
+        set_binary_sensor(this->defrost_sensor_, XYEAdapter::is_defrost_active(qr.protect_flags.value()));
       set_binary_sensor(this->compressor_active_sensor_,
                         qr.compressor_running_flag == CompressorRunningFlag::ACTIVE);
 #endif
+      // The first full poll cycle normally ends with C4, which clears the
+      // forced initial read; without C4 the first C0 completes the cycle.
+      if (!this->extended_query_)
+        ForceReadNextCycle = 0;
       break;
     }
     case Command::QUERY_EXTENDED: {
       bool need_publish = false;
       const auto &exr = rx_data.message.data.extended_query_response;
-      set_sensor(this->outdoor_sensor_, XYEAdapter::get_temperature(exr.outdoor_temperature.value));
-      set_number(this->static_pressure_number_, static_cast<float>(STATIC_PRESSURE_VALUE_MASK & exr.static_pressure));
+      // Same rule as the C0 flags: on a head-only or extended frame these bytes were
+      // zero-filled (a zero outdoor byte decodes to -20 °C), so skip them.
+      if (this->rx_trusted_(RX_OFFSET_C4_OUTDOOR_TEMPERATURE, sizeof(exr.outdoor_temperature)))
+        set_sensor(this->outdoor_sensor_, XYEAdapter::get_temperature(exr.outdoor_temperature.value));
+      if (this->rx_trusted_(RX_OFFSET_C4_STATIC_PRESSURE, sizeof(exr.static_pressure)))
+        set_number(this->static_pressure_number_, static_cast<float>(STATIC_PRESSURE_VALUE_MASK & exr.static_pressure));
       // C4 is the default source for target_temperature, covering both unit modes:
       //  - Fahrenheit: encoded as (°F + FAHRENHEIT_TEMP_OFFSET); convert to Celsius for ESPHome.
       //  - Celsius:    raw integer degrees with bit 6 (0x40) status flag; mask before use.
@@ -710,6 +809,7 @@ void ClimateMideaXYE::dump_config() {
   ESP_LOGCONFIG(Constants::TAG, "  [x] Period: %dms", this->get_update_interval());
   ESP_LOGCONFIG(Constants::TAG, "  [x] Response timeout: %dms", this->response_timeout);
   ESP_LOGCONFIG(Constants::TAG, "  [x] Use Fahrenheit: %d", this->use_fahrenheit_);
+  ESP_LOGCONFIG(Constants::TAG, "  [x] Extended query (C4): %d", this->extended_query_);
 
 #ifdef USE_REMOTE_TRANSMITTER
   ESP_LOGCONFIG(Constants::TAG, "  [x] Using RemoteTransmitter");
@@ -724,21 +824,19 @@ void ClimateMideaXYE::do_follow_me(float temperature, bool beeper) {
   IrFollowMeData data(static_cast<uint8_t>(lroundf(temperature)), beeper);
   this->transmitter_.transmit(data);
 #else
-  // Prepare Follow-Me command for temperature update
-  tx_data = TransmitData(Command::FOLLOW_ME, this->address_);
-  auto &d = tx_data.message.data.standard;
+  // A pending SET carries the user's latest command. Queuing Follow-Me now
+  // would replace it (both go through controlState/queuedCommand) and the SET
+  // would be lost; the reading is kept and sent right after the SET instead.
+  if (this->set_pending_()) {
+    lastFollowMeTemperature = static_cast<uint8_t>(lroundf(temperature));
+    this->follow_me_deferred_ = true;
+    ESP_LOGD(Constants::TAG, "SET pending; Follow-Me update deferred");
+    return;
+  }
+  this->follow_me_deferred_ = false;
 
-  // timer_stop is a subcommand type field for Follow-Me commands.
-  // Subcommand values: 0x06=Init, 0x02=Update, 0x04=Static pressure
-  // The followMeInit flag tracks whether we've sent the initialization command.
-  // It gets reset to false whenever the AC mode changes (see control() function),
-  // ensuring a proper initialization sequence after mode changes.
-  d.timer_stop = followMeInit ? FOLLOWME_SUBCOMMAND_UPDATE : FOLLOWME_SUBCOMMAND_INIT;
-  if (!followMeInit)
-    followMeInit = true;
-  lastFollowMeTemperature = static_cast<uint8_t>(lroundf(temperature));
-  d.mode_flags = static_cast<ModeFlags>(lastFollowMeTemperature);
-  tx_data.update_crc();
+  // Prepare Follow-Me command for temperature update
+  this->build_follow_me_frame_(static_cast<uint8_t>(lroundf(temperature)));
   // Only send if mode is something other than off.
   // Wired controller does not send Follow-Me command when off.
   if (this->mode != ClimateMode::CLIMATE_MODE_OFF) {
@@ -752,11 +850,54 @@ void ClimateMideaXYE::do_follow_me(float temperature, bool beeper) {
 #endif
 }
 
+void ClimateMideaXYE::build_follow_me_frame_(uint8_t temperature) {
+  tx_data = TransmitData(Command::FOLLOW_ME, this->address_);
+  auto &d = tx_data.message.data.standard;
+
+  // timer_stop is a subcommand type field for Follow-Me commands.
+  // Subcommand values: 0x06=Init, 0x02=Update, 0x04=Static pressure
+  // The followMeInit flag tracks whether we've sent the initialization command.
+  // It gets reset to false whenever the AC mode changes (see control() function),
+  // ensuring a proper initialization sequence after mode changes.
+  d.timer_stop = followMeInit ? FOLLOWME_SUBCOMMAND_UPDATE : FOLLOWME_SUBCOMMAND_INIT;
+  // followMeInit is set once the INIT frame is transmitted (update(),
+  // SEND_FOLLOWME), so a frame rebuilt or replaced before then stays INIT.
+  lastFollowMeTemperature = temperature;
+  d.mode_flags = static_cast<ModeFlags>(lastFollowMeTemperature);
+  tx_data.update_crc();
+}
+
+bool ClimateMideaXYE::prepare_follow_me_after_set_() {
+#ifdef USE_REMOTE_TRANSMITTER
+  // Follow-Me travels over IR in this build; nothing to send on the bus.
+  return false;
+#else
+  // Refresh Follow-Me after a SET only when the follow-me sensor has a reading
+  // and the unit is on, like the wired controller does. The sensor's current
+  // state is sent, so a reading that arrived while the SET was pending is not
+  // lost, and nothing is re-sent once the sensor has become unavailable.
+  if (this->follow_me_sensor_ == nullptr || !this->follow_me_sensor_->has_state() ||
+      std::isnan(this->follow_me_sensor_->state) || this->mode == ClimateMode::CLIMATE_MODE_OFF)
+    return false;
+  this->build_follow_me_frame_(static_cast<uint8_t>(lroundf(this->follow_me_sensor_->state)));
+  return true;
+#endif
+}
+
 void ClimateMideaXYE::set_static_pressure(uint8_t static_pressure) {
   if (static_pressure > 15) {
     ESP_LOGW(Constants::TAG, "Cannot set static pressure %d > 15", static_pressure);
     return;
   }
+  // Same rule as Follow-Me: never replace a pending SET (e.g. the power-off
+  // that must precede a static pressure change); send it right after the SET.
+  if (this->set_pending_()) {
+    this->deferred_static_pressure_ = static_pressure;
+    this->static_pressure_deferred_ = true;
+    ESP_LOGD(Constants::TAG, "SET pending; static pressure %u deferred", static_pressure);
+    return;
+  }
+  this->static_pressure_deferred_ = false;
 
   // Prepare Follow-Me command for static pressure setting
   tx_data = TransmitData(Command::FOLLOW_ME, this->address_);
@@ -775,6 +916,21 @@ void ClimateMideaXYE::set_static_pressure(uint8_t static_pressure) {
     ESP_LOGI(Constants::TAG, "Queued setting static pressure to %d", static_pressure);
   } else {
     ESP_LOGW(Constants::TAG, "Cannot set static pressure while unit is running");
+  }
+}
+
+void ClimateMideaXYE::send_deferred_() {
+  // One C6 slot follows the SET: static pressure applies only to a unit that
+  // is off, Follow-Me only to one that is on, so the mode the SET left picks.
+  const bool follow_me = this->follow_me_deferred_;
+  const bool static_pressure = this->static_pressure_deferred_;
+  this->follow_me_deferred_ = false;
+  this->static_pressure_deferred_ = false;
+  if (this->mode == ClimateMode::CLIMATE_MODE_OFF) {
+    if (static_pressure)
+      this->set_static_pressure(this->deferred_static_pressure_);
+  } else if (follow_me) {
+    this->do_follow_me(this->lastFollowMeTemperature, false);
   }
 }
 
