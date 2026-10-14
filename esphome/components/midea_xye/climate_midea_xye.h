@@ -206,6 +206,8 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   /// C4 (QUERY_EXTENDED). For units that never answer C4 and would otherwise report a null
   /// target temperature. The C4 handler skips its target read while this is enabled.
   void set_target_temperature_from_c0(bool yesno) { this->target_temperature_from_c0_ = yesno; }
+  /// When false, the poll cycle is C0 only: no C4 (QUERY_EXTENDED) frame is sent.
+  void set_extended_query(bool yesno) { this->extended_query_ = yesno; }
   void set_static_pressure_number(StaticPressureNumber *number) {
     this->static_pressure_number_ = number;
     number->set_parent(this);
@@ -317,6 +319,9 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // Opt-in (target_temperature_from_c0 YAML option): when true, the setpoint is read from the
   // C0 (QUERY) response instead of C4 (QUERY_EXTENDED), for units that never answer C4.
   bool target_temperature_from_c0_{false};
+  // extended_query YAML option: poll C4 after every C0 (default). The schema only
+  // allows false together with target_temperature_from_c0 and no C4-fed option.
+  bool extended_query_{true};
   Sensor *outdoor_sensor_{nullptr};
   Sensor *fan_speed_sensor_{nullptr};
   Sensor *temperature_2a_sensor_{nullptr};
