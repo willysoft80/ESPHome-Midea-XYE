@@ -276,6 +276,17 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // ignored after we issue a SET. Prevents a transient mode flap
   // (e.g. cool -> off -> cool) while the unit acknowledges the new mode.
   uint8_t post_set_grace_{0};
+  // True while a SET is waiting to be transmitted (either next in line or
+  // queued behind an in-flight transaction). Other commands must not replace it.
+  bool set_pending_() const {
+    return controlState == ControlState::SEND_SET || queuedCommand == ControlState::SEND_SET;
+  }
+  // Follow-Me / static-pressure requests that arrived while a SET was pending.
+  // They go out right after that SET (send_deferred_()), never in its place.
+  bool follow_me_deferred_{false};
+  bool static_pressure_deferred_{false};
+  uint8_t deferred_static_pressure_{0};
+  void send_deferred_();
   // --- Shared-bus arbitration (multiple climate instances on one UART) ---
   // The XYE bus is master/slave: a real CCM polls units strictly one at a time.
   // Multiple instances of this component on one uart each poll on their own
