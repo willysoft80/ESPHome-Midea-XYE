@@ -300,6 +300,12 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // When true, Follow-Me updates send a regular UPDATE subcommand (0x02).
   bool followMeInit;
   uint8_t lastFollowMeTemperature;
+  // Fill tx_data with a Follow-Me (0xC6) frame carrying @p temperature (°C).
+  void build_follow_me_frame_(uint8_t temperature);
+  // After a SET: build the Follow-Me refresh and return true, or return false
+  // when there is nothing to refresh (no follow-me sensor reading, unit off,
+  // IR build).
+  bool prepare_follow_me_after_set_();
   // Number of upcoming QUERY responses whose reported mode should be
   // ignored after we issue a SET. Prevents a transient mode flap
   // (e.g. cool -> off -> cool) while the unit acknowledges the new mode.
