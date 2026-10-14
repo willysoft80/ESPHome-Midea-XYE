@@ -247,6 +247,10 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       // The configured address answered: the bus is responsive, clear the miss
       // counter so a transient gap never accumulates toward a needless sweep.
       this->miss_count_ = 0;
+      this->comm_misses_ = 0;
+#ifdef USE_BINARY_SENSOR
+      set_binary_sensor(this->communication_sensor_, true);
+#endif
       // A unit answered at the active address; surface it so the sensor never
       // sits at "Unknown" for a unit that responds at its configured address
       // (i.e. one that never triggered an auto-discovery sweep).
@@ -302,6 +306,12 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       } else {
         controlState = ControlState::SEND_QUERY;
       }
+      if (this->comm_misses_ < COMMUNICATION_LOST_AFTER_MISSES)
+        this->comm_misses_++;
+#ifdef USE_BINARY_SENSOR
+      if (this->comm_misses_ >= COMMUNICATION_LOST_AFTER_MISSES)
+        set_binary_sensor(this->communication_sensor_, false);
+#endif
       // After recovering, count this miss and (if enabled) start an address
       // sweep once the bus has been unresponsive for discovery_after_ cycles.
       this->maybe_start_discovery_();
@@ -319,6 +329,11 @@ void ClimateMideaXYE::maybe_start_discovery_() {
     return;
   this->discovering_ = true;
   this->scan_addr_ = this->scan_min_;
+#ifdef USE_BINARY_SENSOR
+  // Polling pauses during the sweep, so report the lost unit now rather than
+  // leaving the sensor on until a sweep with a low discovery_after ends.
+  set_binary_sensor(this->communication_sensor_, false);
+#endif
   ESP_LOGW(Constants::TAG, "Address 0x%02X unresponsive for %u cycles; scanning 0x%02X-0x%02X for a unit",
            this->address_, this->miss_count_, this->scan_min_, this->scan_max_);
   this->send_probe_();

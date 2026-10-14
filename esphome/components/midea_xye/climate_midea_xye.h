@@ -125,6 +125,11 @@ constexpr size_t RX_OFFSET_DESTINATION2 = 5;
 /// Bit 7 of the direction byte is a per-unit "this is a reply" marker; mask it
 /// off before comparing (mirrors ReceiveData::is_valid()).
 constexpr uint8_t RX_DIRECTION_REPLY_MASK = 0x7F;
+/// Consecutive failed transactions (no reply, or no valid frame from the unit)
+/// before the optional `communication` binary sensor reports the unit offline.
+/// At the default 1 s period this is ~10 s, so an occasional garbled reply on a
+/// noisy bus does not flap the sensor.
+constexpr uint16_t COMMUNICATION_LOST_AFTER_MISSES = 10;
 /// Maximum consecutive busy-retries within one poll cycle. Past this the cycle is
 /// skipped and the next scheduled update() starts over. Bounds scheduler load when
 /// many instances share one bus.
@@ -194,6 +199,7 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   void set_compressor_active_sensor(binary_sensor::BinarySensor *sensor) {
     this->compressor_active_sensor_ = sensor;
   }
+  void set_communication_sensor(binary_sensor::BinarySensor *sensor) { this->communication_sensor_ = sensor; }
 #endif
   void set_follow_me_sensor(Sensor *sensor);
   void set_internal_current_temperature_sensor(Sensor *sensor) { this->internal_current_temperature_sensor_ = sensor; }
@@ -267,6 +273,9 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   uint16_t miss_count_{0};          // consecutive unanswered polls (normal mode)
   bool discovering_{false};         // true while a sweep is in progress
   uint8_t scan_addr_{0x00};         // address currently being probed
+  // Consecutive failed transactions, counted whether or not auto_discover is on
+  // (miss_count_ only counts while it is). Drives the communication sensor.
+  uint16_t comm_misses_{0};
   // Tracks whether Follow-Me has been initialized after mode change.
   // When false, the next Follow-Me update sends an INIT subcommand (0x06).
   // When true, Follow-Me updates send a regular UPDATE subcommand (0x02).
@@ -332,6 +341,8 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
 #ifdef USE_BINARY_SENSOR
   binary_sensor::BinarySensor *defrost_sensor_{nullptr};
   binary_sensor::BinarySensor *compressor_active_sensor_{nullptr};
+  // On while the unit answers; off after COMMUNICATION_LOST_AFTER_MISSES failures.
+  binary_sensor::BinarySensor *communication_sensor_{nullptr};
 #endif
   Sensor *follow_me_sensor_{nullptr};
   Sensor *internal_current_temperature_sensor_{nullptr};
