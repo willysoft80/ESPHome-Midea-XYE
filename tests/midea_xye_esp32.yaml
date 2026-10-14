@@ -52,6 +52,14 @@ climate:
     defrost:
       name: "Defrost Active"
 
+  # Second unit on the same bus, polled with C0 only
+  - platform: midea_xye
+    id: second_climate
+    name: Test Heatpump 2
+    address: 0x02
+    target_temperature_from_c0: true
+    extended_query: false
+
 # Temperature sensor required for follow_me
 sensor:
   - platform: homeassistant

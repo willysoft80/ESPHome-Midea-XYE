@@ -265,7 +265,7 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       } else {
         switch (cmdSent) {
           case CLIENT_COMMAND_QUERY:
-            controlState = ControlState::SEND_QUERY_EXTENDED;
+            controlState = this->extended_query_ ? ControlState::SEND_QUERY_EXTENDED : ControlState::SEND_QUERY;
             break;
           case CLIENT_COMMAND_SET:
             controlState = ControlState::SEND_FOLLOWME;
@@ -563,6 +563,10 @@ void ClimateMideaXYE::ParseResponse() {
       set_binary_sensor(this->compressor_active_sensor_,
                         qr.compressor_running_flag == CompressorRunningFlag::ACTIVE);
 #endif
+      // The first full poll cycle normally ends with C4, which clears the
+      // forced initial read; without C4 the first C0 completes the cycle.
+      if (!this->extended_query_)
+        ForceReadNextCycle = 0;
       break;
     }
     case Command::QUERY_EXTENDED: {
@@ -710,6 +714,7 @@ void ClimateMideaXYE::dump_config() {
   ESP_LOGCONFIG(Constants::TAG, "  [x] Period: %dms", this->get_update_interval());
   ESP_LOGCONFIG(Constants::TAG, "  [x] Response timeout: %dms", this->response_timeout);
   ESP_LOGCONFIG(Constants::TAG, "  [x] Use Fahrenheit: %d", this->use_fahrenheit_);
+  ESP_LOGCONFIG(Constants::TAG, "  [x] Extended query (C4): %d", this->extended_query_);
 
 #ifdef USE_REMOTE_TRANSMITTER
   ESP_LOGCONFIG(Constants::TAG, "  [x] Using RemoteTransmitter");

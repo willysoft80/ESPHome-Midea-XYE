@@ -71,6 +71,7 @@ CONF_FAN_SPEED = "fan_speed"
 CONF_COMPRESSOR_AWARE_ACTION = "compressor_aware_action"
 CONF_SYNC_FAN_MODE_FROM_DEVICE = "sync_fan_mode_from_device"
 CONF_TARGET_TEMPERATURE_FROM_C0 = "target_temperature_from_c0"
+CONF_EXTENDED_QUERY = "extended_query"
 CONF_AUTO_DISCOVER = "auto_discover"
 CONF_DISCOVERY_AFTER = "discovery_after"
 CONF_DISCOVERED_ADDRESS = "discovered_address"
@@ -140,6 +141,35 @@ validate_swing_modes = cv.enum(ALLOWED_CLIMATE_SWING_MODES, upper=True)
 validate_custom_fan_modes = cv.enum(CUSTOM_FAN_MODES, upper=True)
 validate_custom_presets = cv.enum(CUSTOM_PRESETS, upper=True)
 
+# Options whose data only arrives in the C4 (QUERY_EXTENDED) reply.
+C4_ONLY_KEYS = (CONF_OUTDOOR_TEMPERATURE, CONF_STATIC_PRESSURE)
+
+
+def validate_extended_query(config):
+    if config[CONF_EXTENDED_QUERY]:
+        return config
+    if not config[CONF_TARGET_TEMPERATURE_FROM_C0]:
+        raise cv.Invalid(
+            f"'{CONF_EXTENDED_QUERY}: false' needs '{CONF_TARGET_TEMPERATURE_FROM_C0}: true': "
+            "the setpoint is otherwise read from the C4 reply",
+            path=[CONF_EXTENDED_QUERY],
+        )
+    if config[CONF_SYNC_FAN_MODE_FROM_DEVICE]:
+        raise cv.Invalid(
+            f"'{CONF_SYNC_FAN_MODE_FROM_DEVICE}' reads the C4 reply; it does nothing with "
+            f"'{CONF_EXTENDED_QUERY}: false'",
+            path=[CONF_SYNC_FAN_MODE_FROM_DEVICE],
+        )
+    for key in C4_ONLY_KEYS:
+        if key in config:
+            raise cv.Invalid(
+                f"'{key}' is only sent in the C4 reply; it cannot be used with "
+                f"'{CONF_EXTENDED_QUERY}: false'",
+                path=[key],
+            )
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     climate.climate_schema(ClimateMideaXYE).extend(
         {
@@ -163,6 +193,11 @@ CONFIG_SCHEMA = cv.All(
             # (QUERY_EXTENDED). For units that never answer C4 and would otherwise report a
             # null target temperature. C0 carries the setpoint in the same encoding C4 uses.
             cv.Optional(CONF_TARGET_TEMPERATURE_FROM_C0, default=False): cv.boolean,
+            # Poll the C4 (QUERY_EXTENDED) frame after every C0. Set false for units whose
+            # C4 reply is not understood: every C4 poll then only costs a bus slot and a
+            # warning, and each unit is read twice as often. Requires the setpoint from C0
+            # and no option that is fed by C4 (see validate_extended_query).
+            cv.Optional(CONF_EXTENDED_QUERY, default=True): cv.boolean,
             # Opt-in: if the configured address is unresponsive for `discovery_after`
             # poll cycles, sweep the address range with read-only C0 probes and adopt
             # the first unit that answers. For an isolated one-unit-per-ESP bus.
@@ -304,6 +339,7 @@ CONFIG_SCHEMA = cv.All(
     )
     .extend(uart.UART_DEVICE_SCHEMA)
     .extend(cv.COMPONENT_SCHEMA),
+    validate_extended_query,
     cv.only_with_arduino,
 )
 
@@ -426,6 +462,7 @@ async def to_code(config):
     cg.add(var.set_compressor_aware_action(config[CONF_COMPRESSOR_AWARE_ACTION]))
     cg.add(var.set_sync_fan_mode_from_device(config[CONF_SYNC_FAN_MODE_FROM_DEVICE]))
     cg.add(var.set_target_temperature_from_c0(config[CONF_TARGET_TEMPERATURE_FROM_C0]))
+    cg.add(var.set_extended_query(config[CONF_EXTENDED_QUERY]))
     if CONF_TRANSMITTER_ID in config:
         cg.add_define("USE_REMOTE_TRANSMITTER")
         transmitter_ = await cg.get_variable(config[CONF_TRANSMITTER_ID])
