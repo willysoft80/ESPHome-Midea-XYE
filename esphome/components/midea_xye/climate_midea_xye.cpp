@@ -268,7 +268,10 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
             controlState = ControlState::SEND_QUERY_EXTENDED;
             break;
           case CLIENT_COMMAND_SET:
-            controlState = ControlState::SEND_FOLLOWME;
+            // tx_data still holds the SET frame: going to SEND_FOLLOWME without
+            // building a Follow-Me frame would transmit the same SET again.
+            controlState = this->prepare_follow_me_after_set_() ? ControlState::SEND_FOLLOWME
+                                                                : ControlState::SEND_QUERY;
             break;
           case CLIENT_COMMAND_QUERY_EXTENDED:
             controlState = ControlState::SEND_QUERY;
@@ -427,6 +430,9 @@ void ClimateMideaXYE::update() {
       // If the AC mode changed, follow-me should be
       // refreshed, if emulating the wired controller's
       // behavior.
+      if (tx_data.message.frame.header.command == Command::FOLLOW_ME &&
+          tx_data.message.data.standard.timer_stop == FOLLOWME_SUBCOMMAND_INIT)
+        followMeInit = true;
       cmdSent = CLIENT_COMMAND_FOLLOWME;
       sendRecv(cmdSent);
       if (this->mode == ClimateMode::CLIMATE_MODE_OFF) {
@@ -725,20 +731,7 @@ void ClimateMideaXYE::do_follow_me(float temperature, bool beeper) {
   this->transmitter_.transmit(data);
 #else
   // Prepare Follow-Me command for temperature update
-  tx_data = TransmitData(Command::FOLLOW_ME, this->address_);
-  auto &d = tx_data.message.data.standard;
-
-  // timer_stop is a subcommand type field for Follow-Me commands.
-  // Subcommand values: 0x06=Init, 0x02=Update, 0x04=Static pressure
-  // The followMeInit flag tracks whether we've sent the initialization command.
-  // It gets reset to false whenever the AC mode changes (see control() function),
-  // ensuring a proper initialization sequence after mode changes.
-  d.timer_stop = followMeInit ? FOLLOWME_SUBCOMMAND_UPDATE : FOLLOWME_SUBCOMMAND_INIT;
-  if (!followMeInit)
-    followMeInit = true;
-  lastFollowMeTemperature = static_cast<uint8_t>(lroundf(temperature));
-  d.mode_flags = static_cast<ModeFlags>(lastFollowMeTemperature);
-  tx_data.update_crc();
+  this->build_follow_me_frame_(static_cast<uint8_t>(lroundf(temperature)));
   // Only send if mode is something other than off.
   // Wired controller does not send Follow-Me command when off.
   if (this->mode != ClimateMode::CLIMATE_MODE_OFF) {
@@ -749,6 +742,40 @@ void ClimateMideaXYE::do_follow_me(float temperature, bool beeper) {
     }
     ESP_LOGI(Constants::TAG, "Queued Follow-Me data.");
   }
+#endif
+}
+
+void ClimateMideaXYE::build_follow_me_frame_(uint8_t temperature) {
+  tx_data = TransmitData(Command::FOLLOW_ME, this->address_);
+  auto &d = tx_data.message.data.standard;
+
+  // timer_stop is a subcommand type field for Follow-Me commands.
+  // Subcommand values: 0x06=Init, 0x02=Update, 0x04=Static pressure
+  // The followMeInit flag tracks whether we've sent the initialization command.
+  // It gets reset to false whenever the AC mode changes (see control() function),
+  // ensuring a proper initialization sequence after mode changes.
+  d.timer_stop = followMeInit ? FOLLOWME_SUBCOMMAND_UPDATE : FOLLOWME_SUBCOMMAND_INIT;
+  // followMeInit is set once the INIT frame is transmitted (update(),
+  // SEND_FOLLOWME), so a frame rebuilt or replaced before then stays INIT.
+  lastFollowMeTemperature = temperature;
+  d.mode_flags = static_cast<ModeFlags>(lastFollowMeTemperature);
+  tx_data.update_crc();
+}
+
+bool ClimateMideaXYE::prepare_follow_me_after_set_() {
+#ifdef USE_REMOTE_TRANSMITTER
+  // Follow-Me travels over IR in this build; nothing to send on the bus.
+  return false;
+#else
+  // Refresh Follow-Me after a SET only when the follow-me sensor has a reading
+  // and the unit is on, like the wired controller does. The sensor's current
+  // state is sent, so a reading that arrived while the SET was pending is not
+  // lost, and nothing is re-sent once the sensor has become unavailable.
+  if (this->follow_me_sensor_ == nullptr || !this->follow_me_sensor_->has_state() ||
+      std::isnan(this->follow_me_sensor_->state) || this->mode == ClimateMode::CLIMATE_MODE_OFF)
+    return false;
+  this->build_follow_me_frame_(static_cast<uint8_t>(lroundf(this->follow_me_sensor_->state)));
+  return true;
 #endif
 }
 
