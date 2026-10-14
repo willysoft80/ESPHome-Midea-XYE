@@ -48,8 +48,19 @@ bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_s
       continue;
     // Standard fixed-length frame at this offset?
     memcpy(rx_data.raw, &buf[off], RX_MESSAGE_LENGTH);
-    if (rx_data.is_valid())
+    if (rx_data.is_valid()) {
+      this->rx_trusted_len_ = RX_MESSAGE_LENGTH;
+      // More bytes after a checksum-valid frame mean a burst (observed: Clivet
+      // IB3-XY 53M), where the one-byte checksum can match garbled bytes by
+      // chance: trust only the head then, so a fluke never latches a value.
+      if (off + RX_MESSAGE_LENGTH != n) {
+        memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+        rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+        rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+        this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
+      }
       return true;
+    }
     // Extended variable-length frame: same head layout, dialect-specific extra
     // payload, CRC and prologue only at the very end. Accept when the whole
     // span checksums, then synthesize a standard frame from the trusted head so
@@ -60,10 +71,14 @@ bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_s
       const uint8_t span = static_cast<uint8_t>(end - off);
       if (buf[end - 2] != compute_protocol_crc(&buf[off], span))
         continue;
-      memcpy(rx_data.raw, &buf[off], RX_EXTENDED_TRUSTED_HEAD);
-      memset(rx_data.raw + RX_EXTENDED_TRUSTED_HEAD, 0, RX_MESSAGE_LENGTH - RX_EXTENDED_TRUSTED_HEAD);
+      // The checksum is one byte and is tried at every terminator in the
+      // window, so a garbled tail matches by chance about once per 256
+      // candidates: only the head is trusted.
+      memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
+      memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
       rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
       rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+      this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
       ESP_LOGD(Constants::TAG, "Accepted extended %u-byte response from unit 0x%02X", span, this->address_);
       return true;
     }
@@ -92,6 +107,7 @@ bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_s
     memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
     rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
     rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+    this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
     ESP_LOGD(Constants::TAG, "Accepted head-only response (%u of %u bytes) from unit 0x%02X",
              static_cast<unsigned>(RX_HEADONLY_TRUSTED_LENGTH), static_cast<unsigned>(n), this->address_);
     return true;
@@ -524,7 +540,10 @@ void ClimateMideaXYE::ParseResponse() {
         // and defrost_active=false reproduce the legacy "fan running implies heating/cooling".
         const bool compressor_active = !this->compressor_aware_action_ ||
                                        qr.compressor_running_flag == CompressorRunningFlag::ACTIVE;
+        // Protect flags past the trusted bytes are synthesized zeros: treat defrost
+        // as unknown (inactive), exactly as before, rather than as a reading.
         const bool defrost_active = this->compressor_aware_action_ &&
+                                    this->rx_trusted_(RX_OFFSET_C0_PROTECT_FLAGS, sizeof(qr.protect_flags)) &&
                                     XYEAdapter::is_defrost_active(qr.protect_flags.value());
         update_property(this->action,
                         XYEAdapter::get_climate_action(mode, qr.fan_mode, qr.operation_mode,
@@ -555,11 +574,19 @@ void ClimateMideaXYE::ParseResponse() {
       set_sensor(this->current_sensor_, static_cast<float>(qr.current));
       set_sensor(this->timer_start_sensor_, CalculateGetTime(qr.timer_start));
       set_sensor(this->timer_stop_sensor_, CalculateGetTime(qr.timer_stop));
-      set_sensor(this->error_flags_sensor_, static_cast<float>(qr.error_flags.value()));
-      set_sensor(this->protect_flags_sensor_, static_cast<float>(qr.protect_flags.value()));
+      // Error/protect flags lie past the head-only trusted length; on a head-only
+      // or extended frame they were zero-filled, so keep the last real reading
+      // instead of publishing a fake "no error / no protection / no defrost".
+      const bool error_trusted = this->rx_trusted_(RX_OFFSET_C0_ERROR_FLAGS, sizeof(qr.error_flags));
+      const bool protect_trusted = this->rx_trusted_(RX_OFFSET_C0_PROTECT_FLAGS, sizeof(qr.protect_flags));
+      if (error_trusted)
+        set_sensor(this->error_flags_sensor_, static_cast<float>(qr.error_flags.value()));
+      if (protect_trusted)
+        set_sensor(this->protect_flags_sensor_, static_cast<float>(qr.protect_flags.value()));
       set_sensor(this->fan_speed_sensor_, static_cast<float>(XYEAdapter::get_fan_speed_level(qr.fan_mode)));
 #ifdef USE_BINARY_SENSOR
-      set_binary_sensor(this->defrost_sensor_, XYEAdapter::is_defrost_active(qr.protect_flags.value()));
+      if (protect_trusted)
+        set_binary_sensor(this->defrost_sensor_, XYEAdapter::is_defrost_active(qr.protect_flags.value()));
       set_binary_sensor(this->compressor_active_sensor_,
                         qr.compressor_running_flag == CompressorRunningFlag::ACTIVE);
 #endif
@@ -568,8 +595,12 @@ void ClimateMideaXYE::ParseResponse() {
     case Command::QUERY_EXTENDED: {
       bool need_publish = false;
       const auto &exr = rx_data.message.data.extended_query_response;
-      set_sensor(this->outdoor_sensor_, XYEAdapter::get_temperature(exr.outdoor_temperature.value));
-      set_number(this->static_pressure_number_, static_cast<float>(STATIC_PRESSURE_VALUE_MASK & exr.static_pressure));
+      // Same rule as the C0 flags: on a head-only or extended frame these bytes were
+      // zero-filled (a zero outdoor byte decodes to -20 °C), so skip them.
+      if (this->rx_trusted_(RX_OFFSET_C4_OUTDOOR_TEMPERATURE, sizeof(exr.outdoor_temperature)))
+        set_sensor(this->outdoor_sensor_, XYEAdapter::get_temperature(exr.outdoor_temperature.value));
+      if (this->rx_trusted_(RX_OFFSET_C4_STATIC_PRESSURE, sizeof(exr.static_pressure)))
+        set_number(this->static_pressure_number_, static_cast<float>(STATIC_PRESSURE_VALUE_MASK & exr.static_pressure));
       // C4 is the default source for target_temperature, covering both unit modes:
       //  - Fahrenheit: encoded as (°F + FAHRENHEIT_TEMP_OFFSET); convert to Celsius for ESPHome.
       //  - Celsius:    raw integer degrees with bit 6 (0x40) status flag; mask before use.
