@@ -311,6 +311,10 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // last resort - a structurally-verified head whose tail was garbled by an
   // inter-frame bit-sync loss. Fills rx_data and returns true on success.
   bool extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent);
+  // Structural check of a reply head at p (see extract_frame_).
+  bool reply_head_ok_(const uint8_t *p, uint8_t cmd_sent) const;
+  // Copy of the frame last put on the wire, to recognise a transceiver echo.
+  uint8_t last_tx_[TX_MESSAGE_LENGTH]{};
   // Number of leading bytes of rx_data that came off the wire (and were covered
   // by the acceptance check). Bytes past it were zero-filled by extract_frame_.
   size_t rx_trusted_len_{RX_MESSAGE_LENGTH};
