@@ -256,7 +256,13 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       // Don't parse responses to SET or FOLLOW_ME commands to avoid
       // overwriting the mode we just set. The AC state will be updated
       // on subsequent QUERY cycles.
-      if (cmdSent != CLIENT_COMMAND_SET && cmdSent != CLIENT_COMMAND_FOLLOWME) {
+      // Likewise skip a poll response that was already in flight when
+      // control() queued a SET: it carries the unit's state from before the
+      // command, and parsing it would overwrite the requested mode/setpoint/fan
+      // that setTransmitParams() is about to send - the SET would then carry
+      // the old state and the command would be silently lost.
+      if (cmdSent != CLIENT_COMMAND_SET && cmdSent != CLIENT_COMMAND_FOLLOWME &&
+          queuedCommand != ControlState::SEND_SET) {
         ParseResponse();
       }
       if (queuedCommand != ControlState::WAIT_DATA) {
@@ -305,6 +311,20 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
       // After recovering, count this miss and (if enabled) start an address
       // sweep once the bus has been unresponsive for discovery_after_ cycles.
       this->maybe_start_discovery_();
+    }
+    // The SET has gone out: send what was deferred while it was pending.
+    // If its miss started an address sweep, the SET is not retried, so drop
+    // the deferred requests too instead of replaying them after a later SET.
+    if (cmdSent == CLIENT_COMMAND_SET && !this->set_pending_()) {
+      if (this->discovering_) {
+        if (this->follow_me_deferred_ || this->static_pressure_deferred_) {
+          ESP_LOGD(Constants::TAG, "Unit unresponsive; deferred request dropped");
+        }
+        this->follow_me_deferred_ = false;
+        this->static_pressure_deferred_ = false;
+      } else {
+        this->send_deferred_();
+      }
     }
   });
 }
@@ -382,7 +402,9 @@ void ClimateMideaXYE::finish_discovery_(bool found, uint8_t addr) {
     ESP_LOGW(Constants::TAG, "Address scan found no unit in 0x%02X-0x%02X; resuming polls at 0x%02X",
              this->scan_min_, this->scan_max_, this->address_);
   }
-  this->controlState = ControlState::SEND_QUERY;
+  // A SET requested during the sweep is still pending: send it first.
+  if (!this->set_pending_())
+    this->controlState = ControlState::SEND_QUERY;
 }
 
 void ClimateMideaXYE::publish_discovered_address_() {
@@ -724,6 +746,17 @@ void ClimateMideaXYE::do_follow_me(float temperature, bool beeper) {
   IrFollowMeData data(static_cast<uint8_t>(lroundf(temperature)), beeper);
   this->transmitter_.transmit(data);
 #else
+  // A pending SET carries the user's latest command. Queuing Follow-Me now
+  // would replace it (both go through controlState/queuedCommand) and the SET
+  // would be lost; the reading is kept and sent right after the SET instead.
+  if (this->set_pending_()) {
+    lastFollowMeTemperature = static_cast<uint8_t>(lroundf(temperature));
+    this->follow_me_deferred_ = true;
+    ESP_LOGD(Constants::TAG, "SET pending; Follow-Me update deferred");
+    return;
+  }
+  this->follow_me_deferred_ = false;
+
   // Prepare Follow-Me command for temperature update
   tx_data = TransmitData(Command::FOLLOW_ME, this->address_);
   auto &d = tx_data.message.data.standard;
@@ -757,6 +790,15 @@ void ClimateMideaXYE::set_static_pressure(uint8_t static_pressure) {
     ESP_LOGW(Constants::TAG, "Cannot set static pressure %d > 15", static_pressure);
     return;
   }
+  // Same rule as Follow-Me: never replace a pending SET (e.g. the power-off
+  // that must precede a static pressure change); send it right after the SET.
+  if (this->set_pending_()) {
+    this->deferred_static_pressure_ = static_pressure;
+    this->static_pressure_deferred_ = true;
+    ESP_LOGD(Constants::TAG, "SET pending; static pressure %u deferred", static_pressure);
+    return;
+  }
+  this->static_pressure_deferred_ = false;
 
   // Prepare Follow-Me command for static pressure setting
   tx_data = TransmitData(Command::FOLLOW_ME, this->address_);
@@ -775,6 +817,21 @@ void ClimateMideaXYE::set_static_pressure(uint8_t static_pressure) {
     ESP_LOGI(Constants::TAG, "Queued setting static pressure to %d", static_pressure);
   } else {
     ESP_LOGW(Constants::TAG, "Cannot set static pressure while unit is running");
+  }
+}
+
+void ClimateMideaXYE::send_deferred_() {
+  // One C6 slot follows the SET: static pressure applies only to a unit that
+  // is off, Follow-Me only to one that is on, so the mode the SET left picks.
+  const bool follow_me = this->follow_me_deferred_;
+  const bool static_pressure = this->static_pressure_deferred_;
+  this->follow_me_deferred_ = false;
+  this->static_pressure_deferred_ = false;
+  if (this->mode == ClimateMode::CLIMATE_MODE_OFF) {
+    if (static_pressure)
+      this->set_static_pressure(this->deferred_static_pressure_);
+  } else if (follow_me) {
+    this->do_follow_me(this->lastFollowMeTemperature, false);
   }
 }
 
