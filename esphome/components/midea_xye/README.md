@@ -93,6 +93,8 @@ climate:
       name: Defrost Active
     compressor_active:          # Optional. True while the compressor is running
       name: Compressor Active
+    communication:              # Optional. On while the unit answers polls; off after
+      name: Communication       # ~10 consecutive failed polls (unit off the bus)
     compressor_aware_action: false  # Optional. Opt-in: derive heating/cooling/idle action
                                     # from the compressor + defrost state. Default false
                                     # (legacy: fan running implies heating/cooling).

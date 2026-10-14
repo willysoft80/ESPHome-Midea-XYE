@@ -27,6 +27,7 @@ from esphome.const import (
     DEVICE_CLASS_HUMIDITY,
     DEVICE_CLASS_DURATION,
     DEVICE_CLASS_EMPTY,
+    DEVICE_CLASS_CONNECTIVITY,
     ENTITY_CATEGORY_DIAGNOSTIC,
     ICON_POWER,
     ICON_THERMOMETER,
@@ -67,6 +68,7 @@ CONF_FOLLOW_ME_SENSOR = "follow_me_sensor"
 CONF_INTERNAL_CURRENT_TEMPERATURE = "internal_current_temperature"
 CONF_DEFROST = "defrost"
 CONF_COMPRESSOR_ACTIVE = "compressor_active"
+CONF_COMMUNICATION = "communication"
 CONF_FAN_SPEED = "fan_speed"
 CONF_COMPRESSOR_AWARE_ACTION = "compressor_aware_action"
 CONF_SYNC_FAN_MODE_FROM_DEVICE = "sync_fan_mode_from_device"
@@ -300,6 +302,10 @@ CONFIG_SCHEMA = cv.All(
                 icon="mdi:engine",
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
+            cv.Optional(CONF_COMMUNICATION): binary_sensor.binary_sensor_schema(
+                device_class=DEVICE_CLASS_CONNECTIVITY,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -499,3 +505,6 @@ async def to_code(config):
     if CONF_COMPRESSOR_ACTIVE in config:
         sens = await binary_sensor.new_binary_sensor(config[CONF_COMPRESSOR_ACTIVE])
         cg.add(var.set_compressor_active_sensor(sens))
+    if CONF_COMMUNICATION in config:
+        sens = await binary_sensor.new_binary_sensor(config[CONF_COMMUNICATION])
+        cg.add(var.set_communication_sensor(sens))

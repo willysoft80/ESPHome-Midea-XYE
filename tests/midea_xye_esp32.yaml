@@ -51,6 +51,8 @@ climate:
       name: "XYE Address"
     defrost:
       name: "Defrost Active"
+    communication:
+      name: "Communication"
 
 # Temperature sensor required for follow_me
 sensor:
