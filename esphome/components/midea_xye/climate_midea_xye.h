@@ -10,6 +10,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
 
+#include <cstddef>
 #include <utility>
 #include <vector>
 #ifdef USE_BINARY_SENSOR
@@ -117,6 +118,22 @@ constexpr size_t RX_EXTENDED_TRUSTED_HEAD = 24;
 /// flag), so a structurally-verified head is accepted and the unverifiable
 /// remainder zeroed. Trust ends at mode_flags (byte 20).
 constexpr size_t RX_HEADONLY_TRUSTED_LENGTH = 21;
+/// Receive-frame byte offsets of the fields that lie past the head-only trusted
+/// length (and, for some, past the extended trusted head). Derived from the
+/// packed frame structs so they cannot drift from the layout. A field is only
+/// published when the accepted frame actually carried it (see rx_trusted_len_);
+/// otherwise it would be the synthesized zero, not a reading.
+constexpr size_t RX_OFFSET_C0_ERROR_FLAGS = sizeof(xye::ReceiveMessageFrame) + offsetof(xye::QueryResponseData, error_flags);
+constexpr size_t RX_OFFSET_C0_PROTECT_FLAGS =
+    sizeof(xye::ReceiveMessageFrame) + offsetof(xye::QueryResponseData, protect_flags);
+constexpr size_t RX_OFFSET_C4_OUTDOOR_TEMPERATURE =
+    sizeof(xye::ReceiveMessageFrame) + offsetof(xye::ExtendedQueryResponseData, outdoor_temperature);
+constexpr size_t RX_OFFSET_C4_STATIC_PRESSURE =
+    sizeof(xye::ReceiveMessageFrame) + offsetof(xye::ExtendedQueryResponseData, static_pressure);
+static_assert(RX_OFFSET_C0_ERROR_FLAGS + sizeof(xye::Flags16) == RX_EXTENDED_TRUSTED_HEAD,
+              "the extended trusted head ends with the C0 error flags");
+static_assert(RX_OFFSET_C4_OUTDOOR_TEMPERATURE == RX_HEADONLY_TRUSTED_LENGTH,
+              "the C4 outdoor temperature is the first byte past the head-only trusted length");
 /// Receive-frame byte offsets used by the head-only structural check.
 constexpr size_t RX_OFFSET_COMMAND = 1;
 constexpr size_t RX_OFFSET_DIRECTION = 2;
@@ -294,6 +311,11 @@ class ClimateMideaXYE : public PollingComponent, public climate::Climate, public
   // last resort - a structurally-verified head whose tail was garbled by an
   // inter-frame bit-sync loss. Fills rx_data and returns true on success.
   bool extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent);
+  // Number of leading bytes of rx_data that came off the wire (and were covered
+  // by the acceptance check). Bytes past it were zero-filled by extract_frame_.
+  size_t rx_trusted_len_{RX_MESSAGE_LENGTH};
+  // True when the field at [offset, offset + size) was received, not synthesized.
+  bool rx_trusted_(size_t offset, size_t size) const { return offset + size <= this->rx_trusted_len_; }
 
  protected:
   uart::UARTComponent *uart_;
