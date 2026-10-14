@@ -37,36 +37,76 @@ void ClimateMideaXYE::release_bus_() {
   }
 }
 
+bool ClimateMideaXYE::reply_head_ok_(const uint8_t *p, uint8_t cmd_sent) const {
+  // A reply echoes the command, marks itself as unit -> master, is addressed to
+  // the master on both destination bytes and carries the polled unit's ID.
+  return p[0] == static_cast<uint8_t>(ProtocolMarker::PREAMBLE) &&
+         p[RX_OFFSET_COMMAND] == cmd_sent &&  // responses echo the command byte
+         (p[RX_OFFSET_DIRECTION] & RX_DIRECTION_REPLY_MASK) == static_cast<uint8_t>(TO_CLIENT) &&
+         // replies are addressed to the master (ID 0x00)
+         p[RX_OFFSET_DESTINATION1] == CLIENT_ID && p[RX_OFFSET_DESTINATION2] == CLIENT_ID &&
+         p[RX_OFFSET_SOURCE] == this->address_;
+}
+
 bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_sent) {
   if (n < RX_MESSAGE_LENGTH)
     return false;
+  // The reply starts at the first head that passes the structural check. Later
+  // heads in the same window - the start of a second frame sent back-to-back
+  // (observed: Clivet IB3-XY 53M), or noise - are never considered: a chance
+  // checksum match on them would publish garbage as a reading.
+  size_t off = 0;
+  while (off + RX_HEADONLY_TRUSTED_LENGTH <= n) {
+    // A transceiver that echoes the master's own frame puts it first in the
+    // window, and at address 0x00 its head reads like a reply: skip it.
+    if (off + TX_MESSAGE_LENGTH <= n && memcmp(&buf[off], this->last_tx_, TX_MESSAGE_LENGTH) == 0) {
+      off += TX_MESSAGE_LENGTH;
+      continue;
+    }
+    if (this->reply_head_ok_(&buf[off], cmd_sent))
+      break;
+    off++;
+  }
+  if (off + RX_HEADONLY_TRUSTED_LENGTH > n)
+    return false;
   // Pass 1: CRC-verified frames only.
-  for (size_t off = 0; off + RX_MESSAGE_LENGTH <= n; off++) {
-    if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
-      continue;
-    if (buf[off + RX_OFFSET_SOURCE] != this->address_)
-      continue;
-    // Standard fixed-length frame at this offset?
+  // Standard fixed-length frame at this offset?
+  if (off + RX_MESSAGE_LENGTH <= n) {
     memcpy(rx_data.raw, &buf[off], RX_MESSAGE_LENGTH);
-    if (rx_data.is_valid())
-      return true;
-    // Extended variable-length frame: same head layout, dialect-specific extra
-    // payload, CRC and prologue only at the very end. Accept when the whole
-    // span checksums, then synthesize a standard frame from the trusted head so
-    // ParseResponse can treat it like any other response.
-    for (size_t end = off + RX_MESSAGE_LENGTH + 1; end <= n; end++) {
-      if (buf[end - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
-        continue;
-      const uint8_t span = static_cast<uint8_t>(end - off);
-      if (buf[end - 2] != compute_protocol_crc(&buf[off], span))
-        continue;
-      memcpy(rx_data.raw, &buf[off], RX_EXTENDED_TRUSTED_HEAD);
-      memset(rx_data.raw + RX_EXTENDED_TRUSTED_HEAD, 0, RX_MESSAGE_LENGTH - RX_EXTENDED_TRUSTED_HEAD);
-      rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
-      rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
-      ESP_LOGD(Constants::TAG, "Accepted extended %u-byte response from unit 0x%02X", span, this->address_);
+    if (rx_data.is_valid()) {
+      this->rx_trusted_len_ = RX_MESSAGE_LENGTH;
+      // More bytes after a checksum-valid frame mean a burst (observed: Clivet
+      // IB3-XY 53M), where the one-byte checksum can match garbled bytes by
+      // chance: trust only the head then, so a fluke never latches a value.
+      if (off + RX_MESSAGE_LENGTH != n) {
+        memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+        rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+        rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+        this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
+      }
       return true;
     }
+  }
+  // Extended variable-length frame: same head layout, dialect-specific extra
+  // payload, CRC and prologue only at the very end. Accept when the whole
+  // span checksums, then synthesize a standard frame from the trusted head so
+  // ParseResponse can treat it like any other response.
+  for (size_t end = off + RX_MESSAGE_LENGTH + 1; end <= n; end++) {
+    if (buf[end - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
+      continue;
+    const uint8_t span = static_cast<uint8_t>(end - off);
+    if (buf[end - 2] != compute_protocol_crc(&buf[off], span))
+      continue;
+    // The checksum is one byte and is tried at every terminator in the
+    // window, so a garbled tail matches by chance about once per 256
+    // candidates: only the head is trusted.
+    memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
+    memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+    rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+    rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+    this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
+    ESP_LOGD(Constants::TAG, "Accepted extended %u-byte response from unit 0x%02X", span, this->address_);
+    return true;
   }
   // Pass 2 (fallback): head-only acceptance. Some units (observed: Clivet
   // IB3-XY 53M) transmit a second frame back-to-back after the response with no
@@ -75,28 +115,20 @@ bool ClimateMideaXYE::extract_frame_(const uint8_t *buf, size_t n, uint8_t cmd_s
   // head itself arrives intact on every poll, so accept it when it passes a
   // strict structural check AND the burst still ends with the protocol
   // terminator, then zero the unverifiable remainder.
-  for (size_t off = 0; off + RX_HEADONLY_TRUSTED_LENGTH <= n; off++) {
-    if (buf[off] != static_cast<uint8_t>(ProtocolMarker::PREAMBLE))
-      continue;
-    if (buf[off + RX_OFFSET_COMMAND] != cmd_sent)
-      continue;  // responses echo the command byte
-    if ((buf[off + RX_OFFSET_DIRECTION] & RX_DIRECTION_REPLY_MASK) != static_cast<uint8_t>(TO_CLIENT))
-      continue;
-    if (buf[off + RX_OFFSET_DESTINATION1] != 0x00 || buf[off + RX_OFFSET_DESTINATION2] != 0x00)
-      continue;  // replies are addressed to the master (ID 0x00)
-    if (buf[off + RX_OFFSET_SOURCE] != this->address_)
-      continue;
-    if (buf[n - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
-      continue;  // burst must still end with the protocol terminator
-    memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
-    memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
-    rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
-    rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
-    ESP_LOGD(Constants::TAG, "Accepted head-only response (%u of %u bytes) from unit 0x%02X",
-             static_cast<unsigned>(RX_HEADONLY_TRUSTED_LENGTH), static_cast<unsigned>(n), this->address_);
-    return true;
-  }
-  return false;
+  // A lone frame whose checksum failed is not such a burst: its corruption
+  // can be anywhere, head included.
+  if (n <= off + RX_MESSAGE_LENGTH)
+    return false;
+  if (buf[n - 1] != static_cast<uint8_t>(ProtocolMarker::PROLOGUE))
+    return false;  // burst must still end with the protocol terminator
+  memcpy(rx_data.raw, &buf[off], RX_HEADONLY_TRUSTED_LENGTH);
+  memset(rx_data.raw + RX_HEADONLY_TRUSTED_LENGTH, 0, RX_MESSAGE_LENGTH - RX_HEADONLY_TRUSTED_LENGTH);
+  rx_data.message.frame_end.prologue = ProtocolMarker::PROLOGUE;
+  rx_data.message.frame_end.crc = compute_protocol_crc(rx_data.raw, RX_MESSAGE_LENGTH);
+  this->rx_trusted_len_ = RX_HEADONLY_TRUSTED_LENGTH;
+  ESP_LOGD(Constants::TAG, "Accepted head-only response (%u of %u bytes) from unit 0x%02X",
+           static_cast<unsigned>(RX_HEADONLY_TRUSTED_LENGTH), static_cast<unsigned>(n), this->address_);
+  return true;
 }
 
 static void set_sensor(Sensor *sensor, float value) {
@@ -218,11 +250,16 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
     this->uart_->read_byte(&stale);
   // Log outgoing message at debug level
   tx_data.print_debug(Constants::TAG, TX_MESSAGE_LENGTH, ESPHOME_LOG_LEVEL_DEBUG);
+  // The reply echoes the command byte of the frame actually on the wire, which
+  // is not always cmdSent (on the SEND_FOLLOWME step tx_data can still hold
+  // the SET frame). Captured now: tx_data can be rebuilt during WAIT_DATA.
+  const uint8_t wire_cmd = static_cast<uint8_t>(tx_data.message.frame.header.command);
+  memcpy(this->last_tx_, tx_data.raw, TX_MESSAGE_LENGTH);
   this->uart_->write_array(tx_data.raw, TX_MESSAGE_LENGTH);
   this->uart_->flush();
   controlState = ControlState::WAIT_DATA;
   // Delay for response_timeout ms to allow response from the AC unit.
-  this->set_timeout("read-result", this->response_timeout, [this, cmdSent]() {
+  this->set_timeout("read-result", this->response_timeout, [this, cmdSent, wire_cmd]() {
     // digitalWrite(ComControlPin, RS485_RX_PIN_VALUE);
 
     // Read the whole window into a scratch buffer, then SCAN it for a response
@@ -243,7 +280,7 @@ void ClimateMideaXYE::sendRecv(uint8_t cmdSent) {
     this->release_bus_();
     // extract_frame_ also enforces the Source ID (response byte 4), so on a
     // shared bus a frame from any other unit is never accepted.
-    if (this->extract_frame_(buf, n, cmdSent)) {
+    if (this->extract_frame_(buf, n, wire_cmd)) {
       // The configured address answered: the bus is responsive, clear the miss
       // counter so a transient gap never accumulates toward a needless sweep.
       this->miss_count_ = 0;
@@ -546,7 +583,10 @@ void ClimateMideaXYE::ParseResponse() {
         // and defrost_active=false reproduce the legacy "fan running implies heating/cooling".
         const bool compressor_active = !this->compressor_aware_action_ ||
                                        qr.compressor_running_flag == CompressorRunningFlag::ACTIVE;
+        // Protect flags past the trusted bytes are synthesized zeros: treat defrost
+        // as unknown (inactive), exactly as before, rather than as a reading.
         const bool defrost_active = this->compressor_aware_action_ &&
+                                    this->rx_trusted_(RX_OFFSET_C0_PROTECT_FLAGS, sizeof(qr.protect_flags)) &&
                                     XYEAdapter::is_defrost_active(qr.protect_flags.value());
         update_property(this->action,
                         XYEAdapter::get_climate_action(mode, qr.fan_mode, qr.operation_mode,
@@ -577,11 +617,19 @@ void ClimateMideaXYE::ParseResponse() {
       set_sensor(this->current_sensor_, static_cast<float>(qr.current));
       set_sensor(this->timer_start_sensor_, CalculateGetTime(qr.timer_start));
       set_sensor(this->timer_stop_sensor_, CalculateGetTime(qr.timer_stop));
-      set_sensor(this->error_flags_sensor_, static_cast<float>(qr.error_flags.value()));
-      set_sensor(this->protect_flags_sensor_, static_cast<float>(qr.protect_flags.value()));
+      // Error/protect flags lie past the head-only trusted length; on a head-only
+      // or extended frame they were zero-filled, so keep the last real reading
+      // instead of publishing a fake "no error / no protection / no defrost".
+      const bool error_trusted = this->rx_trusted_(RX_OFFSET_C0_ERROR_FLAGS, sizeof(qr.error_flags));
+      const bool protect_trusted = this->rx_trusted_(RX_OFFSET_C0_PROTECT_FLAGS, sizeof(qr.protect_flags));
+      if (error_trusted)
+        set_sensor(this->error_flags_sensor_, static_cast<float>(qr.error_flags.value()));
+      if (protect_trusted)
+        set_sensor(this->protect_flags_sensor_, static_cast<float>(qr.protect_flags.value()));
       set_sensor(this->fan_speed_sensor_, static_cast<float>(XYEAdapter::get_fan_speed_level(qr.fan_mode)));
 #ifdef USE_BINARY_SENSOR
-      set_binary_sensor(this->defrost_sensor_, XYEAdapter::is_defrost_active(qr.protect_flags.value()));
+      if (protect_trusted)
+        set_binary_sensor(this->defrost_sensor_, XYEAdapter::is_defrost_active(qr.protect_flags.value()));
       set_binary_sensor(this->compressor_active_sensor_,
                         qr.compressor_running_flag == CompressorRunningFlag::ACTIVE);
 #endif
@@ -590,8 +638,12 @@ void ClimateMideaXYE::ParseResponse() {
     case Command::QUERY_EXTENDED: {
       bool need_publish = false;
       const auto &exr = rx_data.message.data.extended_query_response;
-      set_sensor(this->outdoor_sensor_, XYEAdapter::get_temperature(exr.outdoor_temperature.value));
-      set_number(this->static_pressure_number_, static_cast<float>(STATIC_PRESSURE_VALUE_MASK & exr.static_pressure));
+      // Same rule as the C0 flags: on a head-only or extended frame these bytes were
+      // zero-filled (a zero outdoor byte decodes to -20 °C), so skip them.
+      if (this->rx_trusted_(RX_OFFSET_C4_OUTDOOR_TEMPERATURE, sizeof(exr.outdoor_temperature)))
+        set_sensor(this->outdoor_sensor_, XYEAdapter::get_temperature(exr.outdoor_temperature.value));
+      if (this->rx_trusted_(RX_OFFSET_C4_STATIC_PRESSURE, sizeof(exr.static_pressure)))
+        set_number(this->static_pressure_number_, static_cast<float>(STATIC_PRESSURE_VALUE_MASK & exr.static_pressure));
       // C4 is the default source for target_temperature, covering both unit modes:
       //  - Fahrenheit: encoded as (°F + FAHRENHEIT_TEMP_OFFSET); convert to Celsius for ESPHome.
       //  - Celsius:    raw integer degrees with bit 6 (0x40) status flag; mask before use.
